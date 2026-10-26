@@ -14,6 +14,9 @@ class DesktopTests {
    bool missing=args.Length>2&&args[2]=="missing";
    bool shortVideo=args.Length>2&&args[2]=="short";
    bool auto=args.Length>2&&args[2]=="auto";
+   bool delayed=args.Length>2&&args[2]=="delayed-content";
+   bool unavailable=args.Length>2&&args[2]=="unavailable-content";
+   if(unavailable)c.MaxWaitSeconds=3;
    bool coldBound=args.Length>2&&args[2]=="cold-bound";
    bool bound=args.Length>2&&(args[2]=="bound"||coldBound);
    if(bound) {auto=true;c.BindToAppWindow=true;}
@@ -32,6 +35,9 @@ class DesktopTests {
    }
    Console.WriteLine("existing="+Native.Describe(real,c));
    if(real==IntPtr.Zero)throw new Exception("No eligible existing Codex window; test will not cold launch active chat.");
+   ContentEvidence rendered=Native.CaptureContent(real);
+   Console.WriteLine("existing-render="+rendered.HasContent+" "+rendered.Reason);
+   if(!rendered.HasContent)throw new Exception("Existing app rendering could not be verified");
    var screens=Native.Monitors();
    var screen=auto?screens[Geometry.BestMonitor(Native.ClientBounds(real),screens.Select(s=>s.Monitor).ToArray(),screens.FindIndex(s=>(s.Flags&1)!=0))]:screens.First(s=>s.Device==args[1]);
    if(coldBound)screen=screens.First(s=>(s.Flags&1)!=0);
@@ -39,8 +45,12 @@ class DesktopTests {
    var area=screen.Work;int samples=0;bool outside=false,timedout=false;
    int launches=0;
    int discoveryCalls=0;
+   var readinessClock=Stopwatch.StartNew();
    var app=new Application();var boot=missing?new BootWindow(c,args[0],delegate {return IntPtr.Zero;},delegate {launches++;})
-    :coldBound?new BootWindow(c,args[0],delegate {return ++discoveryCalls<=2?IntPtr.Zero:real;},delegate {launches++;}):new BootWindow(c,args[0]);
+    :coldBound?new BootWindow(c,args[0],delegate {return ++discoveryCalls<=2?IntPtr.Zero:real;},delegate {launches++;})
+    :(delayed||unavailable)?new BootWindow(c,args[0],Native.FindApp,null,delegate(IntPtr h) {
+     return unavailable||readinessClock.Elapsed.TotalSeconds<9?new ContentEvidence {Reason="injected-startup-logo-or-unavailable"}:Native.CaptureContent(h);
+    }):new BootWindow(c,args[0]);
    string logPath=Path.Combine(args[0],"logs","launcher.log");
    long logOffset=new FileInfo(logPath).Length;
    var timer=new DispatcherTimer();timer.Interval=TimeSpan.FromMilliseconds(100);var clock=Stopwatch.StartNew();
@@ -60,9 +70,21 @@ class DesktopTests {
     if(code!=2||outside||timedout||launches!=1||!log.Contains("handoff-failed reason=window-or-playback-timeout")||log.Contains("handed-off-to-real-window"))throw new Exception("Missing-window fallback failed exit="+code+" launches="+launches);
     Console.WriteLine("PASS desktop missing-window: one injected launch, bounded timeout, failure UI auto-exit; no real AppLaunch");return 0;
    }
+   if(unavailable) {
+    if(code!=2||log.Contains("handed-off-to-real-window")||log.Contains("live-window-connected"))throw new Exception("Unavailable rendering was revealed");
+    Console.WriteLine("PASS content unavailable: no thumbnail/reveal, bounded failure, exit=2");return 0;
+   }
+   if(delayed&&code==2&&log.Contains("foreground-activation-denied")) {
+    int policyAt=log.IndexOf("content-probe ready=True"),previewAt=log.IndexOf("live-window-connected");
+    if(policyAt<0||(previewAt>=0&&previewAt<policyAt)||!log.Contains("handoff-waiting-for-rendered-content")||clock.Elapsed.TotalSeconds<9)throw new Exception("Delayed content policy failed");
+    Console.WriteLine("PASS delayed-content gate sequencing; foreground handoff NOT VERIFIED (Windows denied activation)");return 0;
+   }
    if(code!=0||outside||timedout||samples<50||!log.Contains("handed-off-to-real-window")||(!coldBound&&log.Contains("app-launch-requested")))throw new Exception("Desktop regression failed samples="+samples+" outside="+outside+" timeout="+timedout+" exit="+code);
    if(coldBound&&(launches!=1||!log.Contains("cold-window-bound-to-player")))throw new Exception("Cold binding/launch regression");
    if(!log.Contains("handoff-cover-retained media-visible=True"))throw new Exception("Handoff cleared the animation cover");
+   int contentAt=log.IndexOf("content-probe ready=True"),thumbnailAt=log.IndexOf("live-window-connected");
+   if(contentAt<0||(thumbnailAt>=0&&thumbnailAt<contentAt))throw new Exception("Target was revealed before rendered content checks passed");
+   if(delayed&&(!log.Contains("handoff-waiting-for-rendered-content")||clock.Elapsed.TotalSeconds<9))throw new Exception("Startup logo was not held behind animation");
    Console.WriteLine("PASS desktop display="+args[1]+" samples="+samples+" seconds="+clock.Elapsed.TotalSeconds.ToString("F2")+" media/window/handoff tested; no AppLaunch");return 0;
   } catch(Exception e) { Console.Error.WriteLine(e);return 1; }
  }

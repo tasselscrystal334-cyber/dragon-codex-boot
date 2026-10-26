@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Text;
 using System.Reflection;
 using System.Web.Script.Serialization;
@@ -18,12 +19,13 @@ using System.Windows.Threading;
 [assembly: AssemblyTitle("Dragon Codex Boot")]
 [assembly: AssemblyProduct("Dragon Codex Boot")]
 [assembly: AssemblyDescription("Community animation launcher for the Codex desktop client")]
-[assembly: AssemblyVersion("0.2.2.0")]
-[assembly: AssemblyFileVersion("0.2.2.0")]
+[assembly: AssemblyVersion("0.2.3.0")]
+[assembly: AssemblyFileVersion("0.2.3.0")]
 
 namespace DragonCodexBoot {
  public sealed class Config {
-  public Config() { AutoReplaceEntrypoints=true; ScanAllLocalDrives=true; }
+  public Config() { AutoReplaceEntrypoints=true; ScanAllLocalDrives=true; WaitForContent=true; }
+  public bool WaitForContent { get; set; }
   public bool AutoReplaceEntrypoints { get; set; }
   public bool ScanAllLocalDrives { get; set; }
   public string DisplayName { get; set; }
@@ -114,7 +116,64 @@ namespace DragonCodexBoot {
    return Lerp(inVideo,new Bounds(0,0,w,h),Ease(fade));
   }
  }
+ public sealed class ContentEvidence {
+  public bool HasContent;
+  public string Reason;
+ }
+ public static class ContentReadiness {
+  // Reject a flat light/dark splash with its logo confined to the center.
+  // This is rendering evidence, not an official application-ready signal.
+  public static ContentEvidence Analyze(int[] rgb,int width,int height) {
+   if(width<40||height<30||rgb==null||rgb.Length!=width*height)return new ContentEvidence {Reason="invalid-capture"};
+   int[] backgrounds=new int[5];
+   int[] xs={5,95,5,95,90},ys={12,12,90,90,80};
+   for(int i=0;i<5;i++)backgrounds[i]=rgb[(height*ys[i]/100)*width+width*xs[i]/100];
+   int[] channels=new int[3];
+   for(int channel=0;channel<3;channel++) {
+    int shift=channel*8;int[] values=backgrounds.Select(p=>(p>>shift)&255).OrderBy(v=>v).ToArray();channels[channel]=values[2];
+   }
+   int ink=0,total=0;int[] regions=new int[12];
+   for(int y=height/10;y<height*95/100;y++)for(int x=width/25;x<width*96/100;x++) {
+    if(x>=width*30/100&&x<=width*70/100&&y>=height/4&&y<=height*75/100)continue;
+    int p=rgb[y*width+x];total++;
+    int delta=Math.Max(Math.Abs((p&255)-channels[0]),Math.Max(Math.Abs(((p>>8)&255)-channels[1]),Math.Abs(((p>>16)&255)-channels[2])));
+    if(delta>24) {ink++;regions[Math.Min(2,y*3/height)*4+Math.Min(3,x*4/width)]++;}
+   }
+   int active=regions.Count(n=>n>=8);double fraction=total==0?0:(double)ink/total;
+   bool content=fraction>=.01&&active>=3;
+   return new ContentEvidence {HasContent=content,Reason=(content?"distributed-rendered-content":"startup-logo-or-flat-frame")+" outer-ink="+fraction.ToString("F4",System.Globalization.CultureInfo.InvariantCulture)+" regions="+active};
+  }
+ }
+ public sealed class ContentGate {
+  private int consecutive;
+  private double last=-100;
+  public void Reset() {consecutive=0;last=-100;}
+  public void Observe(bool hasContent,double now) {
+   if(!hasContent||now-last>1.2)consecutive=0;
+   if(hasContent)consecutive++;last=now;
+  }
+  public bool Ready(double now) {return consecutive>=2&&now-last<=1.2;}
+ }
  internal static class Native {
+  [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr h,IntPtr dc,uint flags);
+  public static ContentEvidence CaptureContent(IntPtr h) {
+   try {
+    SetThreadDpiAwarenessContext(new IntPtr(-4));
+    Bounds b=ClientBounds(h);
+    if(!IsWindow(h)||b.Width<40||b.Height<30||(long)b.Width*b.Height>33554432)return new ContentEvidence {Reason="invalid-window-size"};
+    using(var bitmap=new System.Drawing.Bitmap(b.Width,b.Height,System.Drawing.Imaging.PixelFormat.Format32bppRgb)) {
+     using(var graphics=System.Drawing.Graphics.FromImage(bitmap)) {
+      graphics.Clear(System.Drawing.Color.Black);IntPtr dc=graphics.GetHdc();bool ok;
+      try {ok=PrintWindow(h,dc,3);} finally {graphics.ReleaseHdc(dc);}
+      if(!ok)return new ContentEvidence {Reason="capture-unavailable"};
+     }
+     using(var small=new System.Drawing.Bitmap(bitmap,160,90)) {
+      int[] pixels=new int[160*90];for(int y=0;y<90;y++)for(int x=0;x<160;x++)pixels[y*160+x]=small.GetPixel(x,y).ToArgb();
+      return ContentReadiness.Analyze(pixels,160,90);
+     }
+    }
+   } catch(Exception e) {return new ContentEvidence {Reason="capture-error "+e.GetType().Name};}
+  }
   [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] public struct MonitorInfo {
    public int Size;public Bounds Monitor,Work;public uint Flags;
    [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string Device;
@@ -263,6 +322,7 @@ namespace DragonCodexBoot {
   private readonly Config cfg;
   private readonly Func<Config,IntPtr> findApp;
   private readonly Action<Config> launchOverride;
+  private readonly Func<IntPtr,ContentEvidence> captureContent;
   private readonly string root;
   private readonly MediaElement media;
   private readonly TextBlock status;
@@ -286,6 +346,30 @@ namespace DragonCodexBoot {
   private string autoDisplay;
   private double activationSince=-1,lastActivation=-1;
   private bool existingAtStart;
+  private readonly ContentGate contentGate=new ContentGate();
+  private Task<ContentEvidence> contentProbe;
+  private string contentProbeIdentity;
+  private double nextContentProbe;
+  private bool ContentAllowed {get {return !cfg.WaitForContent||contentGate.Ready(wall.Elapsed.TotalSeconds);}}
+  private void ProbeContent() {
+   if(!cfg.WaitForContent)return;
+   double now=wall.Elapsed.TotalSeconds;
+   if(contentProbe!=null) {
+    if(!contentProbe.IsCompleted)return;
+    ContentEvidence evidence;
+    try {evidence=contentProbe.Result;} catch {evidence=new ContentEvidence {Reason="capture-task-failed"};}
+    contentProbe=null;nextContentProbe=now+.35;
+    if(contentProbeIdentity==targetIdentity) {
+     contentGate.Observe(evidence.HasContent,now);
+     Log("content-probe ready="+ContentAllowed+" "+evidence.Reason);
+     if(!evidence.HasContent) {DropThumbnail();startedFade=false;}
+    }
+   }
+   if(!ready||target==IntPtr.Zero||now<nextContentProbe)return;
+   IntPtr candidate=target;contentProbeIdentity=targetIdentity;
+   // PrintWindow is synchronous; never run capture on the WPF dispatcher.
+   contentProbe=Task.Factory.StartNew(delegate {return captureContent(candidate);});
+  }
   private void BindWindow() {
    if(!cfg.BindToAppWindow||!ready||!Native.Eligible(target,cfg))return;
    if(!existingAtStart&&alignedHandle!=target) {
@@ -332,8 +416,9 @@ namespace DragonCodexBoot {
    if(host!=IntPtr.Zero)Native.SetWindowPos(host,new IntPtr(-1),initialBounds.Left,initialBounds.Top,initialBounds.Width,initialBounds.Height,0x10);
   }
   public BootWindow(Config c,string baseDir):this(c,baseDir,Native.FindApp,null) {}
-  internal BootWindow(Config c,string baseDir,Func<Config,IntPtr> finder,Action<Config> launcher) {
+  internal BootWindow(Config c,string baseDir,Func<Config,IntPtr> finder,Action<Config> launcher,Func<IntPtr,ContentEvidence> capture=null) {
    findApp=finder;launchOverride=launcher;
+   captureContent=capture??Native.CaptureContent;
    // Prefer software composition for the legacy WPF media pipeline on mixed-DPI desktops.
    RenderOptions.ProcessRenderMode=RenderMode.SoftwareOnly;
    cfg=c;root=baseDir;Title=String.IsNullOrWhiteSpace(c.DisplayName)?"Dragon Codex Boot":c.DisplayName;
@@ -434,10 +519,14 @@ namespace DragonCodexBoot {
    double now=wall.Elapsed.TotalSeconds;
    if(now-lastProbe<.25)return;lastProbe=now;
    IntPtr candidate=Native.Eligible(target,cfg)?target:findApp(cfg);
+   if(cfg.WaitForContent&&!ContentAllowed&&now>2) {
+    IntPtr frontmost=findApp(cfg);if(frontmost!=IntPtr.Zero)candidate=frontmost;
+   }
    string identity=Native.WindowIdentity(candidate,cfg);
    lifecycle.Observe(identity,candidate!=IntPtr.Zero&&Native.Responsive(candidate),now);
    ready=lifecycle.Ready;
    if(identity!=targetIdentity) {
+    contentGate.Reset();
     if(targetIdentity!=null)Log("previous-target-lost-or-replaced "+Native.Describe(target,cfg)+" valid="+Native.IsWindow(target)+" visible="+Native.IsWindowVisible(target));
     DropThumbnail();thumbnailFailed=false;alignedHandle=IntPtr.Zero;alignmentAttempts=0;lastAlignment=-1;
     activationSince=-1;lastActivation=-1;
@@ -462,6 +551,7 @@ namespace DragonCodexBoot {
    if(failed) { if(wall.Elapsed.TotalSeconds-failedAt>=8) { closing=true;Application.Current.Shutdown(2); } return; }
    Probe();
    BindWindow();
+   ProbeContent();
    if(lifecycle.Expired(wall.Elapsed.TotalSeconds,cfg.MaxWaitSeconds)) { Fail("window-or-playback-timeout");return; }
    if(handoffRequested) { TryHandOff();return; }
    if(!opened) {
@@ -479,7 +569,7 @@ namespace DragonCodexBoot {
     holding=false;status.Visibility=Visibility.Collapsed;Log("window-available");
    }
    if(ready&&t>=cfg.HoldAt)AlignTarget();
-   if(t>=cfg.TransitionStart&&ready) {
+   if(t>=cfg.TransitionStart&&ready&&ContentAllowed) {
     startedFade=true;RegisterThumbnail();
     double a=Geometry.Ease((t-cfg.TransitionStart)/(cfg.TransitionEnd-cfg.TransitionStart));
     Bounds targetBounds=Native.ClientBounds(target);
@@ -502,26 +592,26 @@ namespace DragonCodexBoot {
    if(failed) { closing=true;Application.Current.Shutdown(2);return; }
    handoffRequested=true;media.Pause();
    Log("handoff-cover-retained media-visible="+(media.Visibility==Visibility.Visible)+" thumbnail="+(thumbnail!=IntPtr.Zero));
-   if(!ready) {status.Text="正在等待 Codex 窗口…";status.Visibility=Visibility.Visible;}
+   if(!ready||!ContentAllowed) {status.Text="Codex 界面仍在加载…";status.Visibility=Visibility.Visible;Log("handoff-waiting-for-rendered-content");}
    TryHandOff();
   }
   private void TryHandOff() {
-   if(!ready||targetIdentity!=Native.WindowIdentity(target,cfg)||!Native.Eligible(target,cfg)||!Native.Responsive(target))return;
+   if(!ready||!ContentAllowed||targetIdentity!=Native.WindowIdentity(target,cfg)||!Native.Eligible(target,cfg)||!Native.Responsive(target))return;
    double now=wall.Elapsed.TotalSeconds;
    if(now-lastActivation<.25)return;
    lastActivation=now;if(activationSince<0)activationSince=now;
    AlignTarget();
    if(Native.IsIconic(target))Native.ShowWindow(target,9);
-   Topmost=false;
+   IntPtr foregroundBefore=Native.GetForegroundWindow();
    bool requested=Native.SetForegroundWindow(target);
    bool activated=Native.GetForegroundWindow()==target;
    if(!Native.Eligible(target,cfg)) { ready=false;Topmost=true;Log("handoff-failed window-invalid");return; }
-   Log("handoff window="+Native.Describe(target,cfg)+" foreground-request="+requested+" foreground-confirmed="+activated);
+   Log("handoff window="+Native.Describe(target,cfg)+" foreground-before=0x"+foregroundBefore.ToInt64().ToString("X")+" host=0x"+host.ToInt64().ToString("X")+" foreground-request="+requested+" foreground-confirmed="+activated);
    if(!activated) {
     if(now-activationSince<1.5) {Log("foreground-activation-pending retry-within-1.5s");return;}
     Fail("foreground-activation-denied; use taskbar to open Codex");return;
    }
-   Native.DwmFlush();
+   Topmost=false;Native.DwmFlush();
    if(!Native.Eligible(target,cfg)||Native.GetForegroundWindow()!=target) {ready=false;Log("handoff-delayed compositor-window-changed");return;}
    closing=true;timer.Stop();Close();Log("handed-off-to-real-window");
   }
@@ -630,7 +720,7 @@ namespace DragonCodexBoot {
     if(args.Contains("--integrate-entrypoints"))return Integrate(root,"Install",true);
     Native.SetProcessDpiAwarenessContext(new IntPtr(-4));
     Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
-    Record(root,"entry version=0.2.2.0");
+    Record(root,"entry version=0.2.3.0");
     bool owns;using(Mutex mutex=new Mutex(true,"Local\\DragonCodexBoot",out owns)) {
      if(!owns) {Record(root,"launch-suppressed reason=launcher-already-running");return 0;}
      Config c=ReadConfig(root);

@@ -25,6 +25,21 @@ class LifecycleTests {
    Check(WindowLifecycle.PrematureEnd(7,.2,4.5),"cached end event at .2 seconds must restart");
    Check(!WindowLifecycle.PrematureEnd(7,7.1,4.5),"normal seven-second media end");
    Check(!WindowLifecycle.PrematureEnd(7,4.6,4.5),"intentional hold not treated as early end");
+   int[] splash=new int[160*90];
+   for(int i=0;i<splash.Length;i++)splash[i]=0xFFFFFF;
+   Check(!ContentReadiness.Analyze(splash,160,90).HasContent,"blank white is not content ready");
+   for(int y=36;y<54;y++)for(int x=70;x<90;x++)splash[y*160+x]=0;
+   Check(!ContentReadiness.Analyze(splash,160,90).HasContent,"centered black logo on white is rejected");
+   for(int i=0;i<splash.Length;i++)splash[i]=0;
+   for(int y=36;y<54;y++)for(int x=70;x<90;x++)splash[y*160+x]=0xFFFFFF;
+   Check(!ContentReadiness.Analyze(splash,160,90).HasContent,"centered light logo on dark is rejected");
+   for(int y=15;y<80;y+=8)for(int x=10;x<35;x++)splash[y*160+x]=0xFFFFFF;
+   Check(ContentReadiness.Analyze(splash,160,90).HasContent,"distributed sidebar content is recognized");
+   var content=new ContentGate();content.Observe(true,0);Check(!content.Ready(0),"one captured frame is insufficient");
+   content.Observe(true,.4);Check(content.Ready(.4),"two rendered samples unlock reveal");
+   content.Observe(false,.5);Check(!content.Ready(.5),"returning to splash blocks reveal");
+   content.Observe(true,.9);content.Observe(true,1.3);Check(!content.Ready(3),"stale capture cannot authorize handoff");
+   content.Reset();Check(!content.Ready(3),"replacement target clears rendered readiness");
    foreach(var area in new Bounds[] {new Bounds(0,0,1920,1032),new Bounds(0,1080,1280,672),new Bounds(-2560,-1440,2560,1392),new Bounds(1920,-900,1600,900),new Bounds(0,0,720,1280)})
     foreach(var size in new int[][] {new[]{1280,720},new[]{1920,1080},new[]{7680,4320}}) {
      Bounds b=Geometry.Fit(area,size[0],size[1]);
