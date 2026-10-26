@@ -39,6 +39,8 @@ namespace DragonCodexBoot {
   public int PlayerWidth { get; set; }
   public int PlayerHeight { get; set; }
   public bool MatchClientToPlayer { get; set; }
+  // Empty means primary display; never depend on cursor or Explorer location.
+  public string TargetDisplay { get; set; }
   public List<ScreenFrame> ScreenFrames { get; set; }
  }
  public sealed class ScreenFrame {
@@ -65,6 +67,11 @@ namespace DragonCodexBoot {
   public static Bounds Centered(Bounds monitor,int width,int height) {
    // These are physical pixels, independent of Windows display scaling.
    return new Bounds(monitor.Left+(monitor.Width-width)/2,monitor.Top+(monitor.Height-height)/2,width,height);
+  }
+  public static Bounds Fit(Bounds area,int width,int height) {
+   if(area.Width<=0||area.Height<=0||width<=0||height<=0)throw new ArgumentException("Invalid placement area");
+   double scale=Math.Min(1,Math.Min((double)area.Width/width,(double)area.Height/height));
+   return Centered(area,Math.Max(1,(int)Math.Floor(width*scale)),Math.Max(1,(int)Math.Floor(height*scale)));
   }
   public static Bounds WindowForClient(Bounds window,Bounds client,Bounds desired) {
    return new Bounds(desired.Left-(client.Left-window.Left),desired.Top-(client.Top-window.Top),
@@ -93,6 +100,25 @@ namespace DragonCodexBoot {
   }
  }
  internal static class Native {
+  [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] public struct MonitorInfo {
+   public int Size;public Bounds Monitor,Work;public uint Flags;
+   [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string Device;
+  }
+  public delegate bool MonitorProc(IntPtr monitor,IntPtr dc,IntPtr rect,IntPtr data);
+  [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr dc,IntPtr clip,MonitorProc proc,IntPtr data);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr h,ref MonitorInfo info);
+  [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr h,int type,out uint x,out uint y);
+  public static List<MonitorInfo> Monitors() {
+   var result=new List<MonitorInfo>();
+   EnumDisplayMonitors(IntPtr.Zero,IntPtr.Zero,delegate(IntPtr h,IntPtr dc,IntPtr r,IntPtr data) {
+    var info=new MonitorInfo { Size=Marshal.SizeOf(typeof(MonitorInfo)) };
+    if(GetMonitorInfo(h,ref info))result.Add(info);return true;
+   },IntPtr.Zero);return result;
+  }
+  [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
+  [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
+  [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] private static extern int GetPackageFamilyName(IntPtr process,ref uint length,StringBuilder name);
   public delegate bool EnumWindowsProc(IntPtr h,IntPtr l);
   [StructLayout(LayoutKind.Sequential)] public struct Point { public int X,Y; }
   [StructLayout(LayoutKind.Sequential)] public struct WindowPos {
@@ -117,6 +143,7 @@ namespace DragonCodexBoot {
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h,int index);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int how);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int w,int ht,uint flags);
   [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr h,uint msg,IntPtr w,IntPtr l,uint flags,uint ms,out IntPtr result);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
@@ -149,57 +176,127 @@ namespace DragonCodexBoot {
    return Math.Abs(actual.Left-desired.Left)<=2&&Math.Abs(actual.Top-desired.Top)<=2
     &&Math.Abs(actual.Width-desired.Width)<=2&&Math.Abs(actual.Height-desired.Height)<=2;
   }
+  public static string Identity(int pid,Config cfg) {
+   IntPtr process=OpenProcess(0x1000,false,pid);
+   if(process==IntPtr.Zero)return null;
+   try {
+    uint length=512;StringBuilder family=new StringBuilder((int)length);
+    string expected=cfg.AppLaunch.Substring("shell:AppsFolder\\".Length).Split('!')[0];
+    if(GetPackageFamilyName(process,ref length,family)!=0||!String.Equals(family.ToString(),expected,StringComparison.OrdinalIgnoreCase))return null;
+    StringBuilder path=new StringBuilder(4096);int size=path.Capacity;
+    if(!QueryFullProcessImageName(process,0,path,ref size))return null;
+    return family+" path="+path;
+   } finally { CloseHandle(process); }
+  }
+  public static string Describe(IntPtr h,Config cfg) {
+   uint pid;GetWindowThreadProcessId(h,out pid);Bounds b=ClientBounds(h);
+   return "hwnd=0x"+h.ToInt64().ToString("X")+" pid="+pid+" identity="+Identity((int)pid,cfg)+" client="+b.Left+","+b.Top+","+b.Width+","+b.Height;
+  }
+  public static string WindowIdentity(IntPtr h,Config cfg) {
+   if(h==IntPtr.Zero)return null;
+   uint pid;GetWindowThreadProcessId(h,out pid);
+   string identity=Identity((int)pid,cfg);if(identity==null)return null;
+   try { using(var p=Process.GetProcessById((int)pid))return h.ToInt64()+":"+pid+":"+p.StartTime.ToUniversalTime().Ticks+":"+identity; }
+   catch { return null; }
+  }
+  public static bool Eligible(IntPtr h,Config cfg) {
+   if(h==IntPtr.Zero||!IsWindow(h)||!IsWindowVisible(h)||GetWindow(h,4)!=IntPtr.Zero||(GetWindowLong(h,-20)&0x08000080)!=0)return false;
+   uint pid;GetWindowThreadProcessId(h,out pid);
+   if(Identity((int)pid,cfg)==null)return false;
+   int cloaked;if(DwmGetWindowAttribute(h,14,out cloaked,4)!=0||cloaked!=0)return false;
+   Bounds b=ClientBounds(h);return b.Width>=450&&b.Height>=280;
+  }
   public static IntPtr FindApp(Config cfg) {
    HashSet<int> pids=new HashSet<int>();
+   int session;using(var current=Process.GetCurrentProcess())session=current.SessionId;
    foreach(string name in cfg.ProcessNames)foreach(Process p in Process.GetProcessesByName(name)) {
     try {
-     string path="";
-     IntPtr process=OpenProcess(0x1000,false,p.Id);
-     if(process!=IntPtr.Zero) {
-      try { StringBuilder buffer=new StringBuilder(4096);int length=buffer.Capacity;if(QueryFullProcessImageName(process,0,buffer,ref length))path=buffer.ToString(); }
-      finally { CloseHandle(process); }
-     }
-     if(path.IndexOf(cfg.ProcessPathContains,StringComparison.OrdinalIgnoreCase)>=0)pids.Add(p.Id);
+     if(p.SessionId==session&&Identity(p.Id,cfg)!=null)pids.Add(p.Id);
     } catch {} finally { p.Dispose(); }
    }
    IntPtr found=IntPtr.Zero;
    EnumWindows(delegate(IntPtr h,IntPtr unused) {
     uint pid;GetWindowThreadProcessId(h,out pid);
-    if(!pids.Contains((int)pid)||!IsWindowVisible(h)||GetWindow(h,4)!=IntPtr.Zero||(GetWindowLong(h,-20)&0x80)!=0)return true;
-    int cloaked;
-    if(DwmGetWindowAttribute(h,14,out cloaked,4)==0&&cloaked!=0)return true;
-    Bounds b=ClientBounds(h);
-    if(b.Width<450||b.Height<280)return true;
+    if(!pids.Contains((int)pid)||!Eligible(h,cfg))return true;
     found=h;return false; // Frontmost eligible main window; no title or screenshot is recorded.
    },IntPtr.Zero);
    return found;
   }
  }
+ // Monotonic clock supplied by the host; test without launching the desktop app.
+ public sealed class WindowLifecycle {
+  private string identity;
+  private double since;
+  public bool LaunchRequested { get; private set; }
+  public bool Ready { get; private set; }
+  public bool RequestLaunch(bool existing) {
+   if(existing||LaunchRequested)return false;
+   LaunchRequested=true;return true;
+  }
+  public void Observe(string candidate,bool responsive,double now) {
+   if(candidate==null||!responsive) { identity=null;Ready=false;return; }
+   if(candidate!=identity) { identity=candidate;since=now;Ready=false; }
+   else Ready=now-since>=.6;
+  }
+  public bool Expired(double now,double limit) { return now>=limit; }
+  public static bool PrematureEnd(double duration,double elapsed,double holdAt) {
+   return duration>1&&elapsed<Math.Min(duration,holdAt)-.5;
+  }
+ }
  public sealed class BootWindow:Window {
   private readonly Config cfg;
+  private readonly Func<Config,IntPtr> findApp;
+  private readonly Action<Config> launchOverride;
   private readonly string root;
   private readonly MediaElement media;
   private readonly TextBlock status;
   private readonly DispatcherTimer timer;
   private readonly Stopwatch wall=new Stopwatch();
-  private IntPtr host,target,thumbnail,stableHandle,alignedHandle;
+  private IntPtr host,target,thumbnail,alignedHandle;
   private Bounds initialBounds;
-  private double stableSince,lastProbe=-1;
+  private double lastProbe=-1;
   private bool ready,opened,holding,closing,startedFade,thumbnailFailed;
   private double endedAt=-1;
-  public BootWindow(Config c,string baseDir) {
+  private readonly WindowLifecycle lifecycle=new WindowLifecycle();
+  private bool handoffRequested,failed;
+  private double failedAt;
+  private string displayName;
+  private string targetIdentity;
+  private double lastPosition,progressAt;
+  private double playbackStarted;
+  private int playbackRetries;
+  private int alignmentAttempts;
+  private double lastAlignment=-1;
+  private void Place() {
+   if(closing)return;
+   Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
+   var screens=Native.Monitors();
+   var screen=screens.FirstOrDefault(s=>String.Equals(s.Device,cfg.TargetDisplay,StringComparison.OrdinalIgnoreCase));
+   if(screen.Device==null) {
+    if(!String.IsNullOrWhiteSpace(cfg.TargetDisplay))Log("display-fallback reason=configured-display-unavailable requested="+cfg.TargetDisplay);
+    screen=screens.First(s=>(s.Flags&1)!=0);
+   }
+   displayName=screen.Device;
+   Bounds area=screen.Work;
+   initialBounds=Geometry.Fit(area,cfg.PlayerWidth,cfg.PlayerHeight);
+   foreach(var s in screens)Log("display="+s.Device+" primary="+((s.Flags&1)!=0)+" physical-bounds="+s.Monitor.Left+","+s.Monitor.Top+","+s.Monitor.Width+","+s.Monitor.Height+" physical-work="+s.Work.Left+","+s.Work.Top+","+s.Work.Width+","+s.Work.Height);
+   Log("placement requested="+cfg.TargetDisplay+" selected="+displayName+" physical="+initialBounds.Left+","+initialBounds.Top+","+initialBounds.Width+","+initialBounds.Height);
+   if(host!=IntPtr.Zero)Native.SetWindowPos(host,new IntPtr(-1),initialBounds.Left,initialBounds.Top,initialBounds.Width,initialBounds.Height,0x10);
+  }
+  public BootWindow(Config c,string baseDir):this(c,baseDir,Native.FindApp,null) {}
+  internal BootWindow(Config c,string baseDir,Func<Config,IntPtr> finder,Action<Config> launcher) {
+   findApp=finder;launchOverride=launcher;
+   // Prefer software composition for the legacy WPF media pipeline on mixed-DPI desktops.
+   RenderOptions.ProcessRenderMode=RenderMode.SoftwareOnly;
    cfg=c;root=baseDir;Title=String.IsNullOrWhiteSpace(c.DisplayName)?"Dragon Codex Boot":c.DisplayName;
    WindowStyle=WindowStyle.None;ResizeMode=ResizeMode.NoResize;ShowInTaskbar=false;
    AllowsTransparency=false;Topmost=true;Background=new SolidColorBrush(Color.FromRgb(250,247,253));
-   target=Native.FindApp(cfg);
-   System.Windows.Forms.Screen screen=target!=IntPtr.Zero?System.Windows.Forms.Screen.FromHandle(target)
-    :System.Windows.Forms.Screen.FromPoint(System.Windows.Forms.Cursor.Position);
-   System.Drawing.Rectangle monitor=screen.Bounds;
-   initialBounds=Geometry.Centered(new Bounds(monitor.Left,monitor.Top,monitor.Width,monitor.Height),cfg.PlayerWidth,cfg.PlayerHeight);
+   target=findApp(cfg);
+   Place();
    Width=cfg.PlayerWidth;Height=cfg.PlayerHeight;WindowStartupLocation=WindowStartupLocation.Manual;
    Grid grid=new Grid();
    media=new MediaElement { LoadedBehavior=MediaState.Manual,UnloadedBehavior=MediaState.Manual,
-    Stretch=Stretch.Uniform,ScrubbingEnabled=true,Volume=Geometry.Clamp(cfg.Volume) };
+    Stretch=Stretch.Uniform,ScrubbingEnabled=false,Volume=Geometry.Clamp(cfg.Volume) };
    grid.Children.Add(media);
    status=new TextBlock { HorizontalAlignment=HorizontalAlignment.Center,VerticalAlignment=VerticalAlignment.Bottom,
     Margin=new Thickness(20,20,20,38),FontSize=16,Foreground=new SolidColorBrush(Color.FromRgb(115,91,144)),
@@ -214,31 +311,52 @@ namespace DragonCodexBoot {
    PreviewKeyDown+=delegate(object sender,KeyEventArgs e) { if(e.Key==Key.Escape) { e.Handled=true;HandOff(); } };
    SourceInitialized+=delegate {
     host=new WindowInteropHelper(this).Handle;
+    Log("host-created hwnd=0x"+host.ToInt64().ToString("X")+" dpi="+Native.GetDpiForWindow(host));
     HwndSource.FromHwnd(host).AddHook(FixedBoundsHook);
     Native.SetWindowPos(host,new IntPtr(-1),initialBounds.Left,initialBounds.Top,initialBounds.Width,initialBounds.Height,0x10);
    };
    Loaded+=delegate {
     wall.Start();
-    if(target==IntPtr.Zero)LaunchApp();
+    if(lifecycle.RequestLaunch(target!=IntPtr.Zero))LaunchApp();
+    else Log("existing-instance "+Native.Describe(target,cfg));
+    if(failed) { timer.Start();return; }
     media.Source=new Uri(Path.GetFullPath(Path.Combine(root,cfg.Video)));
     media.Play();timer.Start();Log("started fixed-player="+initialBounds.Width+"x"+initialBounds.Height
      +" at "+initialBounds.Left+","+initialBounds.Top);
    };
    media.MediaOpened+=delegate {
     opened=true;Bounds actual=Native.ClientBounds(host);
+    playbackStarted=wall.Elapsed.TotalSeconds;progressAt=playbackStarted;
     Log("media-opened player-client="+actual.Width+"x"+actual.Height+" at "+actual.Left+","+actual.Top);
+    Log("media-duration="+(media.NaturalDuration.HasTimeSpan?media.NaturalDuration.TimeSpan.TotalSeconds.ToString():"unknown")+" dpi="+Native.GetDpiForWindow(host));
     Native.SetForegroundWindow(host);
    };
    media.MediaFailed+=delegate(object sender,ExceptionRoutedEventArgs e) {
     Log("media-failed: "+e.ErrorException.Message);status.Text="视频无法播放，正在转入Codex";status.Visibility=Visibility.Visible;
     HandOff();
    };
-   media.MediaEnded+=delegate { endedAt=wall.Elapsed.TotalSeconds;HandOff(); };
+   media.MediaEnded+=delegate {
+    if(closing||failed||handoffRequested)return;
+    double elapsed=wall.Elapsed.TotalSeconds-playbackStarted;
+    double duration=media.NaturalDuration.HasTimeSpan?media.NaturalDuration.TimeSpan.TotalSeconds:0;
+    Log("media-ended position="+media.Position.TotalSeconds+" playback-elapsed="+elapsed);
+    if(WindowLifecycle.PrematureEnd(duration,elapsed,cfg.HoldAt)) {
+     if(playbackRetries++==0) { media.Close();opened=false;lastPosition=0;media.Source=new Uri(Path.GetFullPath(Path.Combine(root,cfg.Video)));media.Play();Log("early-media-end reopen-once");return; }
+     Log("early-media-end repeated; requesting safe handoff");
+    }
+    endedAt=wall.Elapsed.TotalSeconds;HandOff();
+   };
    timer=new DispatcherTimer(DispatcherPriority.Render);timer.Interval=TimeSpan.FromMilliseconds(16);
    timer.Tick+=Tick;
-   Closed+=delegate { timer.Stop();media.Stop();DropThumbnail(); };
+   Closed+=delegate { timer.Stop();media.Close();DropThumbnail(); };
   }
   private IntPtr FixedBoundsHook(IntPtr hwnd,int message,IntPtr wParam,IntPtr lParam,ref bool handled) {
+   if(message==0x007E)Dispatcher.BeginInvoke(new Action(Place));
+   if(message==0x02E0) {
+    Log("dpi-changed dpi="+(wParam.ToInt64()&65535));
+    Dispatcher.BeginInvoke(new Action(Place));
+    handled=true;return IntPtr.Zero;
+   }
    if(message==0x0046&&!closing&&lParam!=IntPtr.Zero) {
     Native.WindowPos pos=(Native.WindowPos)Marshal.PtrToStructure(lParam,typeof(Native.WindowPos));
     pos.X=initialBounds.Left;pos.Y=initialBounds.Top;pos.Width=initialBounds.Width;pos.Height=initialBounds.Height;
@@ -248,27 +366,34 @@ namespace DragonCodexBoot {
    return IntPtr.Zero;
   }
   private void AlignTarget() {
-   if(!cfg.MatchClientToPlayer||target==IntPtr.Zero||alignedHandle==target)return;
-   bool aligned=Native.AlignClient(target,initialBounds);alignedHandle=target;
+   if(!cfg.MatchClientToPlayer||target==IntPtr.Zero||alignedHandle==target||alignmentAttempts>=3||wall.Elapsed.TotalSeconds-lastAlignment<.5)return;
+   alignmentAttempts++;lastAlignment=wall.Elapsed.TotalSeconds;
+   bool aligned=Native.AlignClient(target,initialBounds);if(aligned)alignedHandle=target;
    Log(aligned?"real-window-aligned-to-fixed-player":"real-window-alignment-inexact");
    Native.SetForegroundWindow(host);
   }
   private void LaunchApp() {
    try {
     // Shell launches the packaged desktop app; its CLI helper is never used as a UI executable.
-    Process.Start(new ProcessStartInfo("explorer.exe",cfg.AppLaunch) { UseShellExecute=true });
+    if(launchOverride!=null)launchOverride(cfg);
+    else Process.Start(new ProcessStartInfo("explorer.exe",cfg.AppLaunch) { UseShellExecute=true });
     Log("app-launch-requested");
-   } catch(Exception e) { Log("app-launch-failed: "+e.Message);status.Text="无法自动打开Codex，按Esc退出";status.Visibility=Visibility.Visible; }
+   } catch(Exception e) { Fail("app-launch-failed: "+e.Message); }
   }
   private void Probe() {
    double now=wall.Elapsed.TotalSeconds;
    if(now-lastProbe<.25)return;lastProbe=now;
-   IntPtr candidate=Native.FindApp(cfg);
-   if(candidate==IntPtr.Zero||!Native.Responsive(candidate)) { ready=false;stableHandle=IntPtr.Zero;return; }
-   if(Native.IsIconic(candidate))Native.ShowWindow(candidate,9);
-   if(candidate!=stableHandle) { stableHandle=candidate;stableSince=now;ready=false; }
-   else ready=now-stableSince>=.6;
+   IntPtr candidate=Native.Eligible(target,cfg)?target:findApp(cfg);
+   string identity=Native.WindowIdentity(candidate,cfg);
+   lifecycle.Observe(identity,candidate!=IntPtr.Zero&&Native.Responsive(candidate),now);
+   ready=lifecycle.Ready;
+   if(identity!=targetIdentity) {
+    DropThumbnail();thumbnailFailed=false;alignedHandle=IntPtr.Zero;alignmentAttempts=0;lastAlignment=-1;
+    Log("candidate-changed "+Native.Describe(candidate,cfg));targetIdentity=identity;
+   }
    target=candidate;
+   if(candidate==IntPtr.Zero)return;
+   if(Native.IsIconic(candidate))Native.ShowWindow(candidate,9);
    // Visible/responsive/stable is a window heuristic, not an official Codex content-ready event.
   }
   private void RegisterThumbnail() {
@@ -282,13 +407,17 @@ namespace DragonCodexBoot {
   }
   private void Tick(object sender,EventArgs e) {
    if(closing)return;
+   if(failed) { if(wall.Elapsed.TotalSeconds-failedAt>=8) { closing=true;Application.Current.Shutdown(2); } return; }
    Probe();
-   if(wall.Elapsed.TotalSeconds>cfg.MaxWaitSeconds+20) { Log("wait-timeout");HandOff();return; }
+   if(lifecycle.Expired(wall.Elapsed.TotalSeconds,cfg.MaxWaitSeconds)) { Fail("window-or-playback-timeout");return; }
+   if(handoffRequested) { TryHandOff();return; }
    if(!opened) {
     if(wall.Elapsed.TotalSeconds>12) { Log("media-open-timeout");HandOff(); }
     return;
    }
    double t=media.Position.TotalSeconds;
+   if(t>lastPosition+.02) { lastPosition=t;progressAt=wall.Elapsed.TotalSeconds; }
+   if(!holding&&wall.Elapsed.TotalSeconds-progressAt>8) { Log("playback-stalled");HandOff();return; }
    if(!ready&&!startedFade&&t>=cfg.HoldAt) {
     if(!holding) { media.Pause();media.Position=TimeSpan.FromSeconds(cfg.HoldAt);holding=true;Log("waiting-for-window"); }
     status.Text="Codex正在启动…  Esc跳过";status.Visibility=Visibility.Visible;
@@ -318,21 +447,34 @@ namespace DragonCodexBoot {
    if(endedAt>=0&&wall.Elapsed.TotalSeconds-endedAt>.25)HandOff();
   }
   private void HandOff() {
-   if(closing)return;closing=true;
-   timer.Stop();DropThumbnail();
-   IntPtr app=Native.FindApp(cfg);
-   if(app!=IntPtr.Zero) {
-    if(Native.IsIconic(app))Native.ShowWindow(app,9);
-    // Removes the covering window and hands input to the real application.
-    Close();Native.SetForegroundWindow(app);Log("handed-off-to-real-window");
-   } else {
-    Close();Log("closed-without-window");
-   }
+   if(closing)return;
+   if(failed) { closing=true;Application.Current.Shutdown(2);return; }
+   handoffRequested=true;media.Stop();media.Visibility=Visibility.Collapsed;DropThumbnail();
+   status.Text="正在等待 Codex 窗口…";status.Visibility=Visibility.Visible;
+   TryHandOff();
+  }
+  private void TryHandOff() {
+   if(!ready||targetIdentity!=Native.WindowIdentity(target,cfg)||!Native.Eligible(target,cfg)||!Native.Responsive(target))return;
+   AlignTarget();
+   if(Native.IsIconic(target))Native.ShowWindow(target,9);
+   Topmost=false;
+   bool requested=Native.SetForegroundWindow(target);
+   bool activated=Native.GetForegroundWindow()==target;
+   if(!Native.Eligible(target,cfg)) { ready=false;Topmost=true;Log("handoff-failed window-invalid");return; }
+   Log("handoff window="+Native.Describe(target,cfg)+" foreground-request="+requested+" foreground-confirmed="+activated);
+   if(!activated) { Fail("foreground-activation-denied; use taskbar to open Codex");return; }
+   closing=true;timer.Stop();Close();Log("handed-off-to-real-window");
+  }
+  private void Fail(string reason) {
+   if(failed)return;failed=true;failedAt=wall.Elapsed.TotalSeconds;
+   DropThumbnail();media.Stop();media.Visibility=Visibility.Collapsed;Opacity=1;Topmost=false;
+   status.Text="未能完成交接，请从任务栏打开 Codex。8 秒后退出，Esc 立即退出。";status.Visibility=Visibility.Visible;
+   Log("handoff-failed reason="+reason+" "+Native.Describe(target,cfg));
   }
   private void Log(string s) {
    try {
     Directory.CreateDirectory(Path.Combine(root,"logs"));
-    string line=DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")+" "+s+Environment.NewLine;
+    string line=DateTimeOffset.Now.ToString("o")+" launcher-pid="+Process.GetCurrentProcess().Id+" elapsed="+wall.Elapsed.TotalSeconds.ToString("F3")+" "+s+Environment.NewLine;
     File.AppendAllText(Path.Combine(root,"logs","launcher.log"),line);
    } catch {}
   }
@@ -398,8 +540,8 @@ namespace DragonCodexBoot {
    int placementCases=0;
    foreach(Bounds monitor in new Bounds[] {new Bounds(0,0,1920,1080),new Bounds(0,0,2560,1440),
     new Bounds(0,0,3840,2160),new Bounds(-2560,0,2560,1440),new Bounds(1920,-1440,2560,1440),new Bounds(0,0,1366,768)}) {
-    Bounds fixedPlayer=Geometry.Centered(monitor,c.PlayerWidth,c.PlayerHeight);
-    Assert(fixedPlayer.Width==c.PlayerWidth&&fixedPlayer.Height==c.PlayerHeight,"fixed physical video size");
+    Bounds fixedPlayer=Geometry.Fit(monitor,c.PlayerWidth,c.PlayerHeight);
+    Assert(fixedPlayer.Left>=monitor.Left&&fixedPlayer.Top>=monitor.Top&&fixedPlayer.Right<=monitor.Right&&fixedPlayer.Bottom<=monitor.Bottom,"contained physical video size");
     Assert(Math.Abs(fixedPlayer.Left*2+fixedPlayer.Width-monitor.Left*2-monitor.Width)<=1
      &&Math.Abs(fixedPlayer.Top*2+fixedPlayer.Height-monitor.Top*2-monitor.Height)<=1,"centered monitor");placementCases++;
     Bounds oldWindow=new Bounds(monitor.Left+10,monitor.Top+20,1216,816),oldClient=new Bounds(monitor.Left+18,monitor.Top+28,1200,800);
@@ -423,16 +565,13 @@ namespace DragonCodexBoot {
     if(args.Contains("--self-test"))return SelfTest(root);
     if(args.Contains("--restore-entrypoints"))return Integrate(root,"Restore",true);
     if(args.Contains("--integrate-entrypoints"))return Integrate(root,"Install",true);
+    Native.SetProcessDpiAwarenessContext(new IntPtr(-4));
+    Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
     bool owns;using(Mutex mutex=new Mutex(true,"Local\\DragonCodexBoot",out owns)) {
      if(!owns)return 0;
      Config c=ReadConfig(root);
      if(!File.Exists(Path.GetFullPath(Path.Combine(root,c.Video))))throw new Exception("未找到启动视频。请先运行scripts/Import-Animation.ps1导入自己的MP4，或修改launcher.json的Video路径。");
-     if(c.AutoReplaceEntrypoints) {
-      try { Integrate(root,"Auto",false); }
-      catch(Exception e) {
-       try { Directory.CreateDirectory(Path.Combine(root,"logs"));File.AppendAllText(Path.Combine(root,"logs","launcher.log"),"entrypoint-integration: "+e.Message+Environment.NewLine); } catch {}
-      }
-     }
+     // Shortcut integration is explicit only; retain legacy configuration on disk.
      Application app=new Application();
      app.DispatcherUnhandledException+=delegate(object sender,DispatcherUnhandledExceptionEventArgs e) {
       e.Handled=true;MessageBox.Show("启动器已退出："+e.Exception.Message,"Codex启动");app.Shutdown(1);
