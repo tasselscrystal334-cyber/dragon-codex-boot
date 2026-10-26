@@ -16,7 +16,7 @@ class DesktopTests {
    bool auto=args.Length>2&&args[2]=="auto";
    bool delayed=args.Length>2&&args[2]=="delayed-content";
    bool unavailable=args.Length>2&&args[2]=="unavailable-content";
-   if(unavailable)c.MaxWaitSeconds=3;
+   bool manual=args.Length>2&&args[2]=="manual-entry";
    bool coldBound=args.Length>2&&args[2]=="cold-bound";
    bool bound=args.Length>2&&(args[2]=="bound"||coldBound);
    if(bound) {auto=true;c.BindToAppWindow=true;}
@@ -35,9 +35,14 @@ class DesktopTests {
    }
    Console.WriteLine("existing="+Native.Describe(real,c));
    if(real==IntPtr.Zero)throw new Exception("No eligible existing Codex window; test will not cold launch active chat.");
+   if(auto) {
+    Native.ShowWindow(real,6);
+    try {if(!Native.Eligible(real,c)||Native.FindApp(c)==IntPtr.Zero)throw new Exception("Minimized existing instance was lost");}
+    finally {Native.ShowWindow(real,9);}
+   }
    ContentEvidence rendered=Native.CaptureContent(real);
    Console.WriteLine("existing-render="+rendered.HasContent+" "+rendered.Reason);
-   if(!rendered.HasContent)throw new Exception("Existing app rendering could not be verified");
+   if(!rendered.HasContent)Console.WriteLine("Advisory capture unavailable; exercise bounded fallback instead of blocking startup");
    var screens=Native.Monitors();
    var screen=auto?screens[Geometry.BestMonitor(Native.ClientBounds(real),screens.Select(s=>s.Monitor).ToArray(),screens.FindIndex(s=>(s.Flags&1)!=0))]:screens.First(s=>s.Device==args[1]);
    if(coldBound)screen=screens.First(s=>(s.Flags&1)!=0);
@@ -46,11 +51,16 @@ class DesktopTests {
    int launches=0;
    int discoveryCalls=0;
    var readinessClock=Stopwatch.StartNew();
-   var app=new Application();var boot=missing?new BootWindow(c,args[0],delegate {return IntPtr.Zero;},delegate {launches++;})
+   var app=new Application();BootWindow boot=null;boot=missing?new BootWindow(c,args[0],delegate {return IntPtr.Zero;},delegate {launches++;})
     :coldBound?new BootWindow(c,args[0],delegate {return ++discoveryCalls<=2?IntPtr.Zero:real;},delegate {launches++;})
     :(delayed||unavailable)?new BootWindow(c,args[0],Native.FindApp,null,delegate(IntPtr h) {
      return unavailable||readinessClock.Elapsed.TotalSeconds<9?new ContentEvidence {Reason="injected-startup-logo-or-unavailable"}:Native.CaptureContent(h);
+    },delegate {return true;})
+    :manual?new BootWindow(c,args[0],Native.FindApp,null,null,delegate(IntPtr h) {
+     bool requested=(bool)typeof(BootWindow).GetField("userHandoff",System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance).GetValue(boot);
+     if(!requested)return false;Native.SetForegroundWindow(h);return Native.GetForegroundWindow()==h;
     }):new BootWindow(c,args[0]);
+   if(manual)boot.ShowInTaskbar=true; // Expose only the test host to the UI automation window picker.
    string logPath=Path.Combine(args[0],"logs","launcher.log");
    long logOffset=new FileInfo(logPath).Length;
    var timer=new DispatcherTimer();timer.Interval=TimeSpan.FromMilliseconds(100);var clock=Stopwatch.StartNew();
@@ -61,7 +71,7 @@ class DesktopTests {
      Bounds client=Native.ClientBounds(real);
      if(Math.Abs(client.Left-b.Left)>2||Math.Abs(client.Top-b.Top)>2||Math.Abs(client.Width-b.Width)>2||Math.Abs(client.Height-b.Height)>2)outside=true;
     }
-    if(clock.Elapsed.TotalSeconds>22) { timedout=true;boot.Close(); }
+    if(clock.Elapsed.TotalSeconds>(manual?45:22)) { timedout=true;boot.Close(); }
    };
    boot.Closed+=delegate { timer.Stop(); };timer.Start();int code;
    try {code=app.Run(boot);} finally {if(coldBound)Native.AlignClient(real,originalClient);}
@@ -71,8 +81,8 @@ class DesktopTests {
     Console.WriteLine("PASS desktop missing-window: one injected launch, bounded timeout, failure UI auto-exit; no real AppLaunch");return 0;
    }
    if(unavailable) {
-    if(code!=2||log.Contains("handed-off-to-real-window")||log.Contains("live-window-connected"))throw new Exception("Unavailable rendering was revealed");
-    Console.WriteLine("PASS content unavailable: no thumbnail/reveal, bounded failure, exit=2");return 0;
+    if(code!=0||!log.Contains("handed-off-to-real-window")||!log.Contains("content-unverified-fallback")||log.Contains("live-window-connected")||clock.Elapsed.TotalSeconds>14)throw new Exception("Blank capture blocked bounded handoff fallback");
+    Console.WriteLine("PASS unavailable-content: handoff after bounded advisory delay; activation injected, no real foreground claim");return 0;
    }
    if(delayed&&code==2&&log.Contains("foreground-activation-denied")) {
     int policyAt=log.IndexOf("content-probe ready=True"),previewAt=log.IndexOf("live-window-connected");
@@ -82,8 +92,10 @@ class DesktopTests {
    if(code!=0||outside||timedout||samples<50||!log.Contains("handed-off-to-real-window")||(!coldBound&&log.Contains("app-launch-requested")))throw new Exception("Desktop regression failed samples="+samples+" outside="+outside+" timeout="+timedout+" exit="+code);
    if(coldBound&&(launches!=1||!log.Contains("cold-window-bound-to-player")))throw new Exception("Cold binding/launch regression");
    if(!log.Contains("handoff-cover-retained media-visible=True"))throw new Exception("Handoff cleared the animation cover");
+   if(manual&&!log.Contains("user-requested-handoff content-check-bypassed"))throw new Exception("User-entry fallback was not exercised");
    int contentAt=log.IndexOf("content-probe ready=True"),thumbnailAt=log.IndexOf("live-window-connected");
-   if(contentAt<0||(thumbnailAt>=0&&thumbnailAt<contentAt))throw new Exception("Target was revealed before rendered content checks passed");
+   if(thumbnailAt>=0&&(contentAt<0||thumbnailAt<contentAt))throw new Exception("Thumbnail was revealed before rendered content checks passed");
+   if(contentAt<0&&!log.Contains("content-unverified-fallback"))throw new Exception("Unverified capture lacked explicit bounded fallback");
    if(delayed&&(!log.Contains("handoff-waiting-for-rendered-content")||clock.Elapsed.TotalSeconds<9))throw new Exception("Startup logo was not held behind animation");
    Console.WriteLine("PASS desktop display="+args[1]+" samples="+samples+" seconds="+clock.Elapsed.TotalSeconds.ToString("F2")+" media/window/handoff tested; no AppLaunch");return 0;
   } catch(Exception e) { Console.Error.WriteLine(e);return 1; }

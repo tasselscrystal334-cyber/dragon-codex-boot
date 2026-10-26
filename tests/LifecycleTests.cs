@@ -40,6 +40,10 @@ class LifecycleTests {
    content.Observe(false,.5);Check(!content.Ready(.5),"returning to splash blocks reveal");
    content.Observe(true,.9);content.Observe(true,1.3);Check(!content.Ready(3),"stale capture cannot authorize handoff");
    content.Reset();Check(!content.Ready(3),"replacement target clears rendered readiness");
+   Check(!ContentGate.AllowHandoff(false,false,2.99),"advisory briefly retains cover");
+   Check(ContentGate.AllowHandoff(false,false,3),"blank capture cannot block handoff beyond three seconds");
+   Check(ContentGate.AllowHandoff(false,true,0),"user Enter/Skip bypasses pixel heuristic");
+   Check(ContentGate.AllowHandoff(true,false,0),"verified rendering needs no advisory delay");
    foreach(var area in new Bounds[] {new Bounds(0,0,1920,1032),new Bounds(0,1080,1280,672),new Bounds(-2560,-1440,2560,1392),new Bounds(1920,-900,1600,900),new Bounds(0,0,720,1280)})
     foreach(var size in new int[][] {new[]{1280,720},new[]{1920,1080},new[]{7680,4320}}) {
      Bounds b=Geometry.Fit(area,size[0],size[1]);

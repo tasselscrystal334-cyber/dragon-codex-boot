@@ -19,8 +19,8 @@ using System.Windows.Threading;
 [assembly: AssemblyTitle("Dragon Codex Boot")]
 [assembly: AssemblyProduct("Dragon Codex Boot")]
 [assembly: AssemblyDescription("Community animation launcher for the Codex desktop client")]
-[assembly: AssemblyVersion("0.2.3.0")]
-[assembly: AssemblyFileVersion("0.2.3.0")]
+[assembly: AssemblyVersion("0.2.4.0")]
+[assembly: AssemblyFileVersion("0.2.4.0")]
 
 namespace DragonCodexBoot {
  public sealed class Config {
@@ -153,8 +153,15 @@ namespace DragonCodexBoot {
    if(hasContent)consecutive++;last=now;
   }
   public bool Ready(double now) {return consecutive>=2&&now-last<=1.2;}
+  public static bool AllowHandoff(bool verified,bool userRequested,double waiting) {
+   return verified||userRequested||waiting>=3;
+  }
  }
  internal static class Native {
+  [StructLayout(LayoutKind.Sequential)] private struct Placement {
+   public int Length,Flags,Show;public Point Min,Max;public Bounds Normal;
+  }
+  [DllImport("user32.dll")] private static extern bool GetWindowPlacement(IntPtr h,ref Placement placement);
   [DllImport("user32.dll")] private static extern bool PrintWindow(IntPtr h,IntPtr dc,uint flags);
   public static ContentEvidence CaptureContent(IntPtr h) {
    try {
@@ -279,6 +286,10 @@ namespace DragonCodexBoot {
    uint pid;GetWindowThreadProcessId(h,out pid);
    if(Identity((int)pid,cfg)==null)return false;
    int cloaked;if(DwmGetWindowAttribute(h,14,out cloaked,4)!=0||cloaked!=0)return false;
+   if(IsIconic(h)) {
+    var placement=new Placement {Length=Marshal.SizeOf(typeof(Placement))};
+    return GetWindowPlacement(h,ref placement)&&placement.Normal.Width>=450&&placement.Normal.Height>=280;
+   }
    Bounds b=ClientBounds(h);return b.Width>=450&&b.Height>=280;
   }
   public static IntPtr FindApp(Config cfg) {
@@ -323,6 +334,7 @@ namespace DragonCodexBoot {
   private readonly Func<Config,IntPtr> findApp;
   private readonly Action<Config> launchOverride;
   private readonly Func<IntPtr,ContentEvidence> captureContent;
+  private readonly Func<IntPtr,bool> activationOverride;
   private readonly string root;
   private readonly MediaElement media;
   private readonly TextBlock status;
@@ -350,9 +362,13 @@ namespace DragonCodexBoot {
   private Task<ContentEvidence> contentProbe;
   private string contentProbeIdentity;
   private double nextContentProbe;
+  private readonly Button skip;
+  private bool userHandoff,activationNeedsClick,advisoryLogged;
+  private double handoffStarted=-1;
+  private bool CanHandoff {get {return ContentGate.AllowHandoff(ContentAllowed,userHandoff,handoffStarted<0?0:wall.Elapsed.TotalSeconds-handoffStarted);}}
   private bool ContentAllowed {get {return !cfg.WaitForContent||contentGate.Ready(wall.Elapsed.TotalSeconds);}}
   private void ProbeContent() {
-   if(!cfg.WaitForContent)return;
+   if(!cfg.WaitForContent||userHandoff||(handoffStarted>=0&&wall.Elapsed.TotalSeconds-handoffStarted>=3))return;
    double now=wall.Elapsed.TotalSeconds;
    if(contentProbe!=null) {
     if(!contentProbe.IsCompleted)return;
@@ -371,7 +387,7 @@ namespace DragonCodexBoot {
    contentProbe=Task.Factory.StartNew(delegate {return captureContent(candidate);});
   }
   private void BindWindow() {
-   if(!cfg.BindToAppWindow||!ready||!Native.Eligible(target,cfg))return;
+   if(!cfg.BindToAppWindow||(!ready&&existingAtStart)||!Native.Eligible(target,cfg))return;
    if(!existingAtStart&&alignedHandle!=target) {
     if(!Native.AlignClient(target,initialBounds)) {Log("binding-failed cold-align");return;}
     alignedHandle=target;Log("cold-window-bound-to-player "+Native.Describe(target,cfg));
@@ -416,15 +432,17 @@ namespace DragonCodexBoot {
    if(host!=IntPtr.Zero)Native.SetWindowPos(host,new IntPtr(-1),initialBounds.Left,initialBounds.Top,initialBounds.Width,initialBounds.Height,0x10);
   }
   public BootWindow(Config c,string baseDir):this(c,baseDir,Native.FindApp,null) {}
-  internal BootWindow(Config c,string baseDir,Func<Config,IntPtr> finder,Action<Config> launcher,Func<IntPtr,ContentEvidence> capture=null) {
+  internal BootWindow(Config c,string baseDir,Func<Config,IntPtr> finder,Action<Config> launcher,Func<IntPtr,ContentEvidence> capture=null,Func<IntPtr,bool> activation=null) {
    findApp=finder;launchOverride=launcher;
    captureContent=capture??Native.CaptureContent;
+   activationOverride=activation;
    // Prefer software composition for the legacy WPF media pipeline on mixed-DPI desktops.
    RenderOptions.ProcessRenderMode=RenderMode.SoftwareOnly;
    cfg=c;root=baseDir;Title=String.IsNullOrWhiteSpace(c.DisplayName)?"Dragon Codex Boot":c.DisplayName;
    WindowStyle=WindowStyle.None;ResizeMode=ResizeMode.NoResize;ShowInTaskbar=false;
    AllowsTransparency=false;Topmost=true;Background=Brushes.Black;
    target=findApp(cfg);
+   if(target!=IntPtr.Zero&&Native.IsIconic(target))Native.ShowWindow(target,9);
    existingAtStart=target!=IntPtr.Zero;
    Place();
    Width=cfg.PlayerWidth;Height=cfg.PlayerHeight;WindowStartupLocation=WindowStartupLocation.Manual;
@@ -436,13 +454,13 @@ namespace DragonCodexBoot {
     Margin=new Thickness(20,20,20,38),FontSize=16,Foreground=new SolidColorBrush(Color.FromRgb(115,91,144)),
     Visibility=Visibility.Collapsed };
    grid.Children.Add(status);
-   Button skip=new Button { Content="跳过  Esc",HorizontalAlignment=HorizontalAlignment.Right,
+   skip=new Button { Content="跳过 / 进入 Codex  Esc",HorizontalAlignment=HorizontalAlignment.Right,
     VerticalAlignment=VerticalAlignment.Top,Margin=new Thickness(16),Padding=new Thickness(11,5,11,5),
     Background=Brushes.White,Foreground=new SolidColorBrush(Color.FromRgb(118,97,135)),Opacity=.45 };
-   skip.Click+=delegate { HandOff(); };
+   skip.Click+=delegate { HandOff(true); };
    skip.MouseEnter+=delegate { skip.Opacity=1; };skip.MouseLeave+=delegate { skip.Opacity=.45; };
    grid.Children.Add(skip);Content=grid;
-   PreviewKeyDown+=delegate(object sender,KeyEventArgs e) { if(e.Key==Key.Escape) { e.Handled=true;HandOff(); } };
+   PreviewKeyDown+=delegate(object sender,KeyEventArgs e) { if(e.Key==Key.Escape) { e.Handled=true;HandOff(true); } };
    SourceInitialized+=delegate {
     host=new WindowInteropHelper(this).Handle;
     Log("host-created hwnd=0x"+host.ToInt64().ToString("X")+" dpi="+Native.GetDpiForWindow(host));
@@ -529,7 +547,7 @@ namespace DragonCodexBoot {
     contentGate.Reset();
     if(targetIdentity!=null)Log("previous-target-lost-or-replaced "+Native.Describe(target,cfg)+" valid="+Native.IsWindow(target)+" visible="+Native.IsWindowVisible(target));
     DropThumbnail();thumbnailFailed=false;alignedHandle=IntPtr.Zero;alignmentAttempts=0;lastAlignment=-1;
-    activationSince=-1;lastActivation=-1;
+    activationSince=-1;lastActivation=-1;activationNeedsClick=false;
     Log("candidate-changed "+Native.Describe(candidate,cfg));targetIdentity=identity;
    }
    target=candidate;
@@ -587,32 +605,44 @@ namespace DragonCodexBoot {
    }
    if(endedAt>=0&&wall.Elapsed.TotalSeconds-endedAt>.25)HandOff();
   }
-  private void HandOff() {
+  private void HandOff(bool userRequested=false) {
    if(closing)return;
-   if(failed) { closing=true;Application.Current.Shutdown(2);return; }
+   if(userRequested) {
+    userHandoff=true;activationNeedsClick=false;activationSince=-1;lastActivation=-1;
+    if(!Native.Eligible(target,cfg))target=findApp(cfg);
+    if(target==IntPtr.Zero||failed) {Log("user-dismissed-cover no-usable-window="+(target==IntPtr.Zero));closing=true;Application.Current.Shutdown(failed?2:0);return;}
+    Log("user-requested-handoff content-check-bypassed");
+   }
+   if(failed) {closing=true;Application.Current.Shutdown(2);return;}
+   if(handoffStarted<0)handoffStarted=wall.Elapsed.TotalSeconds;
    handoffRequested=true;media.Pause();
    Log("handoff-cover-retained media-visible="+(media.Visibility==Visibility.Visible)+" thumbnail="+(thumbnail!=IntPtr.Zero));
-   if(!ready||!ContentAllowed) {status.Text="Codex 界面仍在加载…";status.Visibility=Visibility.Visible;Log("handoff-waiting-for-rendered-content");}
+   if(!ready||!ContentAllowed) {status.Text=ready?"正在准备切换 Codex，也可点击右上角直接进入。":"正在等待 Codex 窗口；Esc 退出动画。";status.Visibility=Visibility.Visible;Log("handoff-waiting-for-rendered-content");}
    TryHandOff();
   }
   private void TryHandOff() {
-   if(!ready||!ContentAllowed||targetIdentity!=Native.WindowIdentity(target,cfg)||!Native.Eligible(target,cfg)||!Native.Responsive(target))return;
+   if(activationNeedsClick&&!userHandoff)return;
+   if(!ready||!CanHandoff||targetIdentity!=Native.WindowIdentity(target,cfg)||!Native.Eligible(target,cfg)||!Native.Responsive(target))return;
+   if(!ContentAllowed&&!advisoryLogged) {advisoryLogged=true;Log("content-unverified-fallback reason=advisory-only");}
    double now=wall.Elapsed.TotalSeconds;
    if(now-lastActivation<.25)return;
    lastActivation=now;if(activationSince<0)activationSince=now;
    AlignTarget();
    if(Native.IsIconic(target))Native.ShowWindow(target,9);
    IntPtr foregroundBefore=Native.GetForegroundWindow();
-   bool requested=Native.SetForegroundWindow(target);
-   bool activated=Native.GetForegroundWindow()==target;
+   bool requested=activationOverride==null?Native.SetForegroundWindow(target):activationOverride(target);
+   bool activated=activationOverride==null?Native.GetForegroundWindow()==target:requested;
    if(!Native.Eligible(target,cfg)) { ready=false;Topmost=true;Log("handoff-failed window-invalid");return; }
    Log("handoff window="+Native.Describe(target,cfg)+" foreground-before=0x"+foregroundBefore.ToInt64().ToString("X")+" host=0x"+host.ToInt64().ToString("X")+" foreground-request="+requested+" foreground-confirmed="+activated);
    if(!activated) {
     if(now-activationSince<1.5) {Log("foreground-activation-pending retry-within-1.5s");return;}
-    Fail("foreground-activation-denied; use taskbar to open Codex");return;
+    activationNeedsClick=true;userHandoff=false;
+    skip.Content="点击进入 Codex";
+    status.Text="Codex 窗口已出现；Windows 阻止自动切换，请点击右上角进入。";status.Visibility=Visibility.Visible;
+    Log("foreground-activation-denied awaiting-user-click");return;
    }
    Topmost=false;Native.DwmFlush();
-   if(!Native.Eligible(target,cfg)||Native.GetForegroundWindow()!=target) {ready=false;Log("handoff-delayed compositor-window-changed");return;}
+   if(!Native.Eligible(target,cfg)||(activationOverride==null&&Native.GetForegroundWindow()!=target)) {ready=false;Log("handoff-delayed compositor-window-changed");return;}
    closing=true;timer.Stop();Close();Log("handed-off-to-real-window");
   }
   private void Fail(string reason) {
@@ -720,7 +750,7 @@ namespace DragonCodexBoot {
     if(args.Contains("--integrate-entrypoints"))return Integrate(root,"Install",true);
     Native.SetProcessDpiAwarenessContext(new IntPtr(-4));
     Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
-    Record(root,"entry version=0.2.3.0");
+    Record(root,"entry version=0.2.4.0");
     bool owns;using(Mutex mutex=new Mutex(true,"Local\\DragonCodexBoot",out owns)) {
      if(!owns) {Record(root,"launch-suppressed reason=launcher-already-running");return 0;}
      Config c=ReadConfig(root);

@@ -17,7 +17,8 @@ if($LASTEXITCODE -ne 0) {throw 'Compile failed'}
 $originalConfig=Join-Path $InstallRoot 'launcher.json'
 $config=Get-Content -LiteralPath $originalConfig -Raw | ConvertFrom-Json
 $video=[IO.Path]::GetFullPath((Join-Path $InstallRoot $config.Video))
-foreach($case in @(@('DISPLAY1','normal'),@('DISPLAY2','normal'),@('DISPLAY2','auto'),@('DISPLAY2','bound'),@('DISPLAY2','cold-bound'),@('DISPLAY2','short'),@('DISPLAY2','missing'),@('DISPLAY2','delayed-content'),@('DISPLAY2','unavailable-content'))) {
+foreach($case in @(@('DISPLAY1','normal'),@('DISPLAY2','normal'),@('DISPLAY2','auto'),@('DISPLAY2','bound'),@('DISPLAY2','cold-bound'),@('DISPLAY2','short'),@('DISPLAY2','missing'),@('DISPLAY2','delayed-content'),@('DISPLAY2','unavailable-content'),@('DISPLAY2','manual-entry'))) {
+ if($case[1] -eq 'manual-entry' -and (!$Modes -or 'manual-entry' -notin $Modes)) {continue}
  if($Modes -and $case[1] -notin $Modes) {continue}
  $run=Join-Path $qa ($case[0]+'-'+$case[1])
  New-Item -ItemType Directory -Force $run | Out-Null
