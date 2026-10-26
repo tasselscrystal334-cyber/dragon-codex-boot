@@ -13,6 +13,8 @@ class DesktopTests {
    Config c=Entry.ReadConfig(args[0]);c.TargetDisplay=args[1];
    bool missing=args.Length>2&&args[2]=="missing";
    bool shortVideo=args.Length>2&&args[2]=="short";
+   bool auto=args.Length>2&&args[2]=="auto";
+   if(auto)c.TargetDisplay="auto";
    if(shortVideo) { c.HoldAt=11.3;c.TransitionStart=12.7;c.TransitionEnd=13.65; }
    if(missing)c.MaxWaitSeconds=2;
    c.Video=args[3];c.MatchClientToPlayer=false;
@@ -27,7 +29,8 @@ class DesktopTests {
    }
    Console.WriteLine("existing="+Native.Describe(real,c));
    if(real==IntPtr.Zero)throw new Exception("No eligible existing Codex window; test will not cold launch active chat.");
-   var screen=Native.Monitors().First(s=>s.Device==args[1]);
+   var screens=Native.Monitors();
+   var screen=auto?screens[Geometry.BestMonitor(Native.ClientBounds(real),screens.Select(s=>s.Monitor).ToArray(),screens.FindIndex(s=>(s.Flags&1)!=0))]:screens.First(s=>s.Device==args[1]);
    var area=screen.Work;int samples=0;bool outside=false,timedout=false;
    int launches=0;
    var app=new Application();var boot=missing?new BootWindow(c,args[0],delegate {return IntPtr.Zero;},delegate {launches++;}):new BootWindow(c,args[0]);

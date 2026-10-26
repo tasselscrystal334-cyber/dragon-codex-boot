@@ -32,6 +32,10 @@ class LifecycleTests {
      Check(Math.Abs(b.Width*(double)size[1]/size[0]-b.Height)<2,"preserve aspect");
     }
    Bounds exact=Geometry.Fit(new Bounds(0,1080,1280,720),1280,720);
+   var monitors=new[]{new Bounds(0,0,1920,1080),new Bounds(0,1080,1280,720)};
+   Check(Geometry.BestMonitor(new Bounds(0,1100,1000,600),monitors,0)==1,"auto uses existing app display");
+   Check(Geometry.BestMonitor(new Bounds(),monitors,0)==0,"cold launch uses primary");
+   Check(Geometry.BestMonitor(new Bounds(-2000,0,400,400),monitors,0)==0,"offscreen app falls back to primary");
    Check(exact.Left==0&&exact.Top==1080,"reported vertical display regression");
    Bounds work=Geometry.Fit(new Bounds(0,1080,1280,672),1280,720);
    Check(work.Left==43&&work.Top==1080&&work.Width==1194&&work.Height==672,"taskbar-aware secondary placement");

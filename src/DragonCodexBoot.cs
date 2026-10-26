@@ -18,8 +18,8 @@ using System.Windows.Threading;
 [assembly: AssemblyTitle("Dragon Codex Boot")]
 [assembly: AssemblyProduct("Dragon Codex Boot")]
 [assembly: AssemblyDescription("Community animation launcher for the Codex desktop client")]
-[assembly: AssemblyVersion("0.2.0.0")]
-[assembly: AssemblyFileVersion("0.2.0.0")]
+[assembly: AssemblyVersion("0.2.1.0")]
+[assembly: AssemblyFileVersion("0.2.1.0")]
 
 namespace DragonCodexBoot {
  public sealed class Config {
@@ -72,6 +72,15 @@ namespace DragonCodexBoot {
    if(area.Width<=0||area.Height<=0||width<=0||height<=0)throw new ArgumentException("Invalid placement area");
    double scale=Math.Min(1,Math.Min((double)area.Width/width,(double)area.Height/height));
    return Centered(area,Math.Max(1,(int)Math.Floor(width*scale)),Math.Max(1,(int)Math.Floor(height*scale)));
+  }
+  public static int BestMonitor(Bounds window,Bounds[] monitors,int primary) {
+   long best=0;int selected=primary;
+   for(int i=0;i<monitors.Length;i++) {
+    long overlap=(long)Math.Max(0,Math.Min(window.Right,monitors[i].Right)-Math.Max(window.Left,monitors[i].Left))
+     *Math.Max(0,Math.Min(window.Bottom,monitors[i].Bottom)-Math.Max(window.Top,monitors[i].Top));
+    if(overlap>best) {best=overlap;selected=i;}
+   }
+   return selected;
   }
   public static Bounds WindowForClient(Bounds window,Bounds client,Bounds desired) {
    return new Bounds(desired.Left-(client.Left-window.Left),desired.Top-(client.Top-window.Top),
@@ -267,11 +276,18 @@ namespace DragonCodexBoot {
   private int playbackRetries;
   private int alignmentAttempts;
   private double lastAlignment=-1;
+  private string autoDisplay;
+  private double activationSince=-1,lastActivation=-1;
   private void Place() {
    if(closing)return;
    Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
    var screens=Native.Monitors();
-   var screen=screens.FirstOrDefault(s=>String.Equals(s.Device,cfg.TargetDisplay,StringComparison.OrdinalIgnoreCase));
+   if(String.Equals(cfg.TargetDisplay,"auto",StringComparison.OrdinalIgnoreCase)&&autoDisplay==null) {
+    int primary=screens.FindIndex(s=>(s.Flags&1)!=0);
+    autoDisplay=screens[Geometry.BestMonitor(Native.ClientBounds(target),screens.Select(s=>s.Monitor).ToArray(),primary)].Device;
+   }
+   string requestedDisplay=autoDisplay??cfg.TargetDisplay;
+   var screen=screens.FirstOrDefault(s=>String.Equals(s.Device,requestedDisplay,StringComparison.OrdinalIgnoreCase));
    if(screen.Device==null) {
     if(!String.IsNullOrWhiteSpace(cfg.TargetDisplay))Log("display-fallback reason=configured-display-unavailable requested="+cfg.TargetDisplay);
     screen=screens.First(s=>(s.Flags&1)!=0);
@@ -317,6 +333,7 @@ namespace DragonCodexBoot {
    };
    Loaded+=delegate {
     wall.Start();
+    if(!Native.Eligible(target,cfg))target=findApp(cfg);
     if(lifecycle.RequestLaunch(target!=IntPtr.Zero))LaunchApp();
     else Log("existing-instance "+Native.Describe(target,cfg));
     if(failed) { timer.Start();return; }
@@ -388,7 +405,9 @@ namespace DragonCodexBoot {
    lifecycle.Observe(identity,candidate!=IntPtr.Zero&&Native.Responsive(candidate),now);
    ready=lifecycle.Ready;
    if(identity!=targetIdentity) {
+    if(targetIdentity!=null)Log("previous-target-lost-or-replaced "+Native.Describe(target,cfg)+" valid="+Native.IsWindow(target)+" visible="+Native.IsWindowVisible(target));
     DropThumbnail();thumbnailFailed=false;alignedHandle=IntPtr.Zero;alignmentAttempts=0;lastAlignment=-1;
+    activationSince=-1;lastActivation=-1;
     Log("candidate-changed "+Native.Describe(candidate,cfg));targetIdentity=identity;
    }
    target=candidate;
@@ -419,12 +438,11 @@ namespace DragonCodexBoot {
    if(t>lastPosition+.02) { lastPosition=t;progressAt=wall.Elapsed.TotalSeconds; }
    if(!holding&&wall.Elapsed.TotalSeconds-progressAt>8) { Log("playback-stalled");HandOff();return; }
    if(!ready&&!startedFade&&t>=cfg.HoldAt) {
-    if(!holding) { media.Pause();media.Position=TimeSpan.FromSeconds(cfg.HoldAt);holding=true;Log("waiting-for-window"); }
+    if(!holding) { holding=true;Log("waiting-for-window animation-continues"); }
     status.Text="Codex正在启动…  Esc跳过";status.Visibility=Visibility.Visible;
-    return;
    }
    if(holding&&ready) {
-    holding=false;status.Visibility=Visibility.Collapsed;media.Play();Log("window-available");
+    holding=false;status.Visibility=Visibility.Collapsed;Log("window-available");
    }
    if(ready&&t>=cfg.HoldAt)AlignTarget();
    if(t>=cfg.TransitionStart&&ready) {
@@ -449,12 +467,15 @@ namespace DragonCodexBoot {
   private void HandOff() {
    if(closing)return;
    if(failed) { closing=true;Application.Current.Shutdown(2);return; }
-   handoffRequested=true;media.Stop();media.Visibility=Visibility.Collapsed;DropThumbnail();
+   handoffRequested=true;media.Stop();media.Visibility=Visibility.Collapsed;Opacity=1;DropThumbnail();
    status.Text="正在等待 Codex 窗口…";status.Visibility=Visibility.Visible;
    TryHandOff();
   }
   private void TryHandOff() {
    if(!ready||targetIdentity!=Native.WindowIdentity(target,cfg)||!Native.Eligible(target,cfg)||!Native.Responsive(target))return;
+   double now=wall.Elapsed.TotalSeconds;
+   if(now-lastActivation<.25)return;
+   lastActivation=now;if(activationSince<0)activationSince=now;
    AlignTarget();
    if(Native.IsIconic(target))Native.ShowWindow(target,9);
    Topmost=false;
@@ -462,7 +483,10 @@ namespace DragonCodexBoot {
    bool activated=Native.GetForegroundWindow()==target;
    if(!Native.Eligible(target,cfg)) { ready=false;Topmost=true;Log("handoff-failed window-invalid");return; }
    Log("handoff window="+Native.Describe(target,cfg)+" foreground-request="+requested+" foreground-confirmed="+activated);
-   if(!activated) { Fail("foreground-activation-denied; use taskbar to open Codex");return; }
+   if(!activated) {
+    if(now-activationSince<1.5) {Log("foreground-activation-pending retry-within-1.5s");return;}
+    Fail("foreground-activation-denied; use taskbar to open Codex");return;
+   }
    closing=true;timer.Stop();Close();Log("handed-off-to-real-window");
   }
   private void Fail(string reason) {
@@ -480,6 +504,9 @@ namespace DragonCodexBoot {
   }
  }
  public static class Entry {
+  private static void Record(string root,string message) {
+   try {Directory.CreateDirectory(Path.Combine(root,"logs"));File.AppendAllText(Path.Combine(root,"logs","launcher.log"),DateTimeOffset.Now.ToString("o")+" launcher-pid="+Process.GetCurrentProcess().Id+" "+message+Environment.NewLine);} catch {}
+  }
   private static int Integrate(string root,string action,bool wait) {
    string script=Path.Combine(root,"scripts","integrate-entrypoints.ps1");
    if(!File.Exists(script))throw new FileNotFoundException("启动入口脚本缺失，请完整解压程序包。",script);
@@ -567,18 +594,21 @@ namespace DragonCodexBoot {
     if(args.Contains("--integrate-entrypoints"))return Integrate(root,"Install",true);
     Native.SetProcessDpiAwarenessContext(new IntPtr(-4));
     Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
+    Record(root,"entry version=0.2.1.0");
     bool owns;using(Mutex mutex=new Mutex(true,"Local\\DragonCodexBoot",out owns)) {
-     if(!owns)return 0;
+     if(!owns) {Record(root,"launch-suppressed reason=launcher-already-running");return 0;}
      Config c=ReadConfig(root);
      if(!File.Exists(Path.GetFullPath(Path.Combine(root,c.Video))))throw new Exception("未找到启动视频。请先运行scripts/Import-Animation.ps1导入自己的MP4，或修改launcher.json的Video路径。");
      // Shortcut integration is explicit only; retain legacy configuration on disk.
      Application app=new Application();
      app.DispatcherUnhandledException+=delegate(object sender,DispatcherUnhandledExceptionEventArgs e) {
+      Record(root,"dispatcher-exception "+e.Exception);
       e.Handled=true;MessageBox.Show("启动器已退出："+e.Exception.Message,"Codex启动");app.Shutdown(1);
      };
      return app.Run(new BootWindow(c,root));
     }
    } catch(Exception e) {
+    Record(root,"startup-exception "+e);
     if(args.Contains("--self-test")) { File.WriteAllText(Path.Combine(root,"self-test-error.txt"),e.ToString());return 1; }
     MessageBox.Show(e.Message,"Codex启动");return 1;
    }

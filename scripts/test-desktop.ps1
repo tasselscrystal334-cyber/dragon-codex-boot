@@ -17,7 +17,7 @@ if($LASTEXITCODE -ne 0) {throw 'Compile failed'}
 $originalConfig=Join-Path $InstallRoot 'launcher.json'
 $config=Get-Content -LiteralPath $originalConfig -Raw | ConvertFrom-Json
 $video=[IO.Path]::GetFullPath((Join-Path $InstallRoot $config.Video))
-foreach($case in @(@('DISPLAY1','normal'),@('DISPLAY2','normal'),@('DISPLAY2','short'),@('DISPLAY2','missing'))) {
+foreach($case in @(@('DISPLAY1','normal'),@('DISPLAY2','normal'),@('DISPLAY2','auto'),@('DISPLAY2','short'),@('DISPLAY2','missing'))) {
  $run=Join-Path $qa ($case[0]+'-'+$case[1])
  New-Item -ItemType Directory -Force $run | Out-Null
  Copy-Item -LiteralPath $originalConfig -Destination (Join-Path $run 'launcher.json')
