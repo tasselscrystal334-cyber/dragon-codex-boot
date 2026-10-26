@@ -19,8 +19,8 @@ using System.Windows.Threading;
 [assembly: AssemblyTitle("Dragon Codex Boot")]
 [assembly: AssemblyProduct("Dragon Codex Boot")]
 [assembly: AssemblyDescription("Community animation launcher for the Codex desktop client")]
-[assembly: AssemblyVersion("0.2.4.0")]
-[assembly: AssemblyFileVersion("0.2.4.0")]
+[assembly: AssemblyVersion("0.2.5.0")]
+[assembly: AssemblyFileVersion("0.2.5.0")]
 
 namespace DragonCodexBoot {
  public sealed class Config {
@@ -145,9 +145,11 @@ namespace DragonCodexBoot {
   }
  }
  public sealed class ContentGate {
+  public bool Presented {get;private set;}
+  public void MarkPresented() {Presented=true;}
   private int consecutive;
   private double last=-100;
-  public void Reset() {consecutive=0;last=-100;}
+  public void Reset() {consecutive=0;last=-100;Presented=false;}
   public void Observe(bool hasContent,double now) {
    if(!hasContent||now-last>1.2)consecutive=0;
    if(hasContent)consecutive++;last=now;
@@ -365,7 +367,7 @@ namespace DragonCodexBoot {
   private readonly Button skip;
   private bool userHandoff,activationNeedsClick,advisoryLogged;
   private double handoffStarted=-1;
-  private bool CanHandoff {get {return ContentGate.AllowHandoff(ContentAllowed,userHandoff,handoffStarted<0?0:wall.Elapsed.TotalSeconds-handoffStarted);}}
+  private bool CanHandoff {get {return contentGate.Presented||ContentGate.AllowHandoff(ContentAllowed,userHandoff,handoffStarted<0?0:wall.Elapsed.TotalSeconds-handoffStarted);}}
   private bool ContentAllowed {get {return !cfg.WaitForContent||contentGate.Ready(wall.Elapsed.TotalSeconds);}}
   private void ProbeContent() {
    if(!cfg.WaitForContent||userHandoff||(handoffStarted>=0&&wall.Elapsed.TotalSeconds-handoffStarted>=3))return;
@@ -378,7 +380,7 @@ namespace DragonCodexBoot {
     if(contentProbeIdentity==targetIdentity) {
      contentGate.Observe(evidence.HasContent,now);
      Log("content-probe ready="+ContentAllowed+" "+evidence.Reason);
-     if(!evidence.HasContent) {DropThumbnail();startedFade=false;}
+     if(!evidence.HasContent&&!contentGate.Presented) {DropThumbnail();startedFade=false;}
     }
    }
    if(!ready||target==IntPtr.Zero||now<nextContentProbe)return;
@@ -570,6 +572,7 @@ namespace DragonCodexBoot {
    Probe();
    BindWindow();
    ProbeContent();
+   if(contentGate.Presented&&!activationNeedsClick)status.Visibility=Visibility.Collapsed;
    if(lifecycle.Expired(wall.Elapsed.TotalSeconds,cfg.MaxWaitSeconds)) { Fail("window-or-playback-timeout");return; }
    if(handoffRequested) { TryHandOff();return; }
    if(!opened) {
@@ -587,7 +590,7 @@ namespace DragonCodexBoot {
     holding=false;status.Visibility=Visibility.Collapsed;Log("window-available");
    }
    if(ready&&t>=cfg.HoldAt)AlignTarget();
-   if(t>=cfg.TransitionStart&&ready&&ContentAllowed) {
+   if(t>=cfg.TransitionStart&&ready&&(ContentAllowed||contentGate.Presented)) {
     startedFade=true;RegisterThumbnail();
     double a=Geometry.Ease((t-cfg.TransitionStart)/(cfg.TransitionEnd-cfg.TransitionStart));
     Bounds targetBounds=Native.ClientBounds(target);
@@ -600,6 +603,7 @@ namespace DragonCodexBoot {
      };
      int hr=Native.DwmUpdateThumbnailProperties(thumbnail,ref props);
      if(hr!=0) { Log("dwm-update-failed: "+hr);DropThumbnail();thumbnailFailed=true; }
+     else if(props.Opacity>0&&!contentGate.Presented) {contentGate.MarkPresented();status.Visibility=Visibility.Collapsed;Log("real-window-presented waiting-overlay-cleared");}
     }
     // Without a live thumbnail retain the animation until the actual target is activated.
    }
@@ -617,7 +621,8 @@ namespace DragonCodexBoot {
    if(handoffStarted<0)handoffStarted=wall.Elapsed.TotalSeconds;
    handoffRequested=true;media.Pause();
    Log("handoff-cover-retained media-visible="+(media.Visibility==Visibility.Visible)+" thumbnail="+(thumbnail!=IntPtr.Zero));
-   if(!ready||!ContentAllowed) {status.Text=ready?"正在准备切换 Codex，也可点击右上角直接进入。":"正在等待 Codex 窗口；Esc 退出动画。";status.Visibility=Visibility.Visible;Log("handoff-waiting-for-rendered-content");}
+   if(!ready||!CanHandoff) {status.Text=ready?"正在准备切换 Codex，也可点击右上角直接进入。":"正在等待 Codex 窗口；Esc 退出动画。";status.Visibility=Visibility.Visible;Log("handoff-waiting-for-rendered-content");}
+   else status.Visibility=Visibility.Collapsed;
    TryHandOff();
   }
   private void TryHandOff() {
@@ -750,7 +755,7 @@ namespace DragonCodexBoot {
     if(args.Contains("--integrate-entrypoints"))return Integrate(root,"Install",true);
     Native.SetProcessDpiAwarenessContext(new IntPtr(-4));
     Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
-    Record(root,"entry version=0.2.4.0");
+    Record(root,"entry version=0.2.5.0");
     bool owns;using(Mutex mutex=new Mutex(true,"Local\\DragonCodexBoot",out owns)) {
      if(!owns) {Record(root,"launch-suppressed reason=launcher-already-running");return 0;}
      Config c=ReadConfig(root);

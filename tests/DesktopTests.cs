@@ -17,6 +17,7 @@ class DesktopTests {
    bool delayed=args.Length>2&&args[2]=="delayed-content";
    bool unavailable=args.Length>2&&args[2]=="unavailable-content";
    bool manual=args.Length>2&&args[2]=="manual-entry";
+   bool stale=args.Length>2&&args[2]=="preview-stale";
    bool coldBound=args.Length>2&&args[2]=="cold-bound";
    bool bound=args.Length>2&&(args[2]=="bound"||coldBound);
    if(bound) {auto=true;c.BindToAppWindow=true;}
@@ -56,6 +57,7 @@ class DesktopTests {
     :(delayed||unavailable)?new BootWindow(c,args[0],Native.FindApp,null,delegate(IntPtr h) {
      return unavailable||readinessClock.Elapsed.TotalSeconds<9?new ContentEvidence {Reason="injected-startup-logo-or-unavailable"}:Native.CaptureContent(h);
     },delegate {return true;})
+    :stale?new BootWindow(c,args[0],Native.FindApp,null,null,delegate {return true;})
     :manual?new BootWindow(c,args[0],Native.FindApp,null,null,delegate(IntPtr h) {
      bool requested=(bool)typeof(BootWindow).GetField("userHandoff",System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance).GetValue(boot);
      if(!requested)return false;Native.SetForegroundWindow(h);return Native.GetForegroundWindow()==h;
@@ -64,7 +66,17 @@ class DesktopTests {
    string logPath=Path.Combine(args[0],"logs","launcher.log");
    long logOffset=new FileInfo(logPath).Length;
    var timer=new DispatcherTimer();timer.Interval=TimeSpan.FromMilliseconds(100);var clock=Stopwatch.StartNew();
+   int staleFrames=0;bool waitingReappeared=false;
    timer.Tick+=delegate {
+    if(stale) {
+     var flags=System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance;
+     var gate=(ContentGate)typeof(BootWindow).GetField("contentGate",flags).GetValue(boot);
+     if(gate.Presented) {
+      gate.Observe(false,clock.Elapsed.TotalSeconds);staleFrames++;
+      var label=(System.Windows.Controls.TextBlock)typeof(BootWindow).GetField("status",flags).GetValue(boot);
+      if(label.Visibility==Visibility.Visible)waitingReappeared=true;
+     }
+    }
     var h=new WindowInteropHelper(boot).Handle;Bounds b=Native.ClientBounds(h);
     if(b.Width>0) { samples++;if(b.Left<area.Left||b.Top<area.Top||b.Right>area.Right||b.Bottom>area.Bottom)outside=true; }
     if(bound&&clock.Elapsed.TotalSeconds>1) {
@@ -93,6 +105,7 @@ class DesktopTests {
    if(coldBound&&(launches!=1||!log.Contains("cold-window-bound-to-player")))throw new Exception("Cold binding/launch regression");
    if(!log.Contains("handoff-cover-retained media-visible=True"))throw new Exception("Handoff cleared the animation cover");
    if(manual&&!log.Contains("user-requested-handoff content-check-bypassed"))throw new Exception("User-entry fallback was not exercised");
+   if(stale&&(staleFrames==0||waitingReappeared||!log.Contains("real-window-presented")||log.Contains("handoff-waiting-for-rendered-content")||clock.Elapsed.TotalSeconds>9))throw new Exception("Presented app was covered again by stale readiness");
    int contentAt=log.IndexOf("content-probe ready=True"),thumbnailAt=log.IndexOf("live-window-connected");
    if(thumbnailAt>=0&&(contentAt<0||thumbnailAt<contentAt))throw new Exception("Thumbnail was revealed before rendered content checks passed");
    if(contentAt<0&&!log.Contains("content-unverified-fallback"))throw new Exception("Unverified capture lacked explicit bounded fallback");

@@ -44,6 +44,9 @@ class LifecycleTests {
    Check(ContentGate.AllowHandoff(false,false,3),"blank capture cannot block handoff beyond three seconds");
    Check(ContentGate.AllowHandoff(false,true,0),"user Enter/Skip bypasses pixel heuristic");
    Check(ContentGate.AllowHandoff(true,false,0),"verified rendering needs no advisory delay");
+   content.MarkPresented();content.Observe(false,4);
+   Check(content.Presented&&!content.Ready(4),"visible app stays presented when a later image sample is empty");
+   content.Reset();Check(!content.Presented,"replacement window must not inherit prior presentation");
    foreach(var area in new Bounds[] {new Bounds(0,0,1920,1032),new Bounds(0,1080,1280,672),new Bounds(-2560,-1440,2560,1392),new Bounds(1920,-900,1600,900),new Bounds(0,0,720,1280)})
     foreach(var size in new int[][] {new[]{1280,720},new[]{1920,1080},new[]{7680,4320}}) {
      Bounds b=Geometry.Fit(area,size[0],size[1]);
