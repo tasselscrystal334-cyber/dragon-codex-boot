@@ -18,8 +18,8 @@ using System.Windows.Threading;
 [assembly: AssemblyTitle("Dragon Codex Boot")]
 [assembly: AssemblyProduct("Dragon Codex Boot")]
 [assembly: AssemblyDescription("Community animation launcher for the Codex desktop client")]
-[assembly: AssemblyVersion("0.2.1.0")]
-[assembly: AssemblyFileVersion("0.2.1.0")]
+[assembly: AssemblyVersion("0.2.2.0")]
+[assembly: AssemblyFileVersion("0.2.2.0")]
 
 namespace DragonCodexBoot {
  public sealed class Config {
@@ -39,6 +39,7 @@ namespace DragonCodexBoot {
   public int PlayerWidth { get; set; }
   public int PlayerHeight { get; set; }
   public bool MatchClientToPlayer { get; set; }
+  public bool BindToAppWindow { get; set; }
   // Empty means primary display; never depend on cursor or Explorer location.
   public string TargetDisplay { get; set; }
   public List<ScreenFrame> ScreenFrames { get; set; }
@@ -72,6 +73,11 @@ namespace DragonCodexBoot {
    if(area.Width<=0||area.Height<=0||width<=0||height<=0)throw new ArgumentException("Invalid placement area");
    double scale=Math.Min(1,Math.Min((double)area.Width/width,(double)area.Height/height));
    return Centered(area,Math.Max(1,(int)Math.Floor(width*scale)),Math.Max(1,(int)Math.Floor(height*scale)));
+  }
+  public static Bounds Contain(Bounds desired,Bounds area) {
+   Bounds fitted=Fit(area,desired.Width,desired.Height);
+   return new Bounds(Math.Max(area.Left,Math.Min(desired.Left,area.Right-fitted.Width)),
+    Math.Max(area.Top,Math.Min(desired.Top,area.Bottom-fitted.Height)),fitted.Width,fitted.Height);
   }
   public static int BestMonitor(Bounds window,Bounds[] monitors,int primary) {
    long best=0;int selected=primary;
@@ -161,6 +167,7 @@ namespace DragonCodexBoot {
   [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
   [DllImport("dwmapi.dll")] public static extern int DwmRegisterThumbnail(IntPtr dest,IntPtr source,out IntPtr thumb);
   [DllImport("dwmapi.dll")] public static extern int DwmUnregisterThumbnail(IntPtr thumb);
+  [DllImport("dwmapi.dll")] public static extern int DwmFlush();
   [DllImport("dwmapi.dll")] public static extern int DwmUpdateThumbnailProperties(IntPtr thumb,ref ThumbProperties props);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h,int attr,out int val,int size);
   public static Bounds ClientBounds(IntPtr h) {
@@ -278,6 +285,26 @@ namespace DragonCodexBoot {
   private double lastAlignment=-1;
   private string autoDisplay;
   private double activationSince=-1,lastActivation=-1;
+  private bool existingAtStart;
+  private void BindWindow() {
+   if(!cfg.BindToAppWindow||!ready||!Native.Eligible(target,cfg))return;
+   if(!existingAtStart&&alignedHandle!=target) {
+    if(!Native.AlignClient(target,initialBounds)) {Log("binding-failed cold-align");return;}
+    alignedHandle=target;Log("cold-window-bound-to-player "+Native.Describe(target,cfg));
+   }
+   Bounds client=Native.ClientBounds(target);
+   var screens=Native.Monitors();
+   int index=Geometry.BestMonitor(client,screens.Select(s=>s.Monitor).ToArray(),screens.FindIndex(s=>(s.Flags&1)!=0));
+   Bounds desired=Geometry.Contain(client,screens[index].Work);
+   if(client.Left!=desired.Left||client.Top!=desired.Top||client.Width!=desired.Width||client.Height!=desired.Height) {
+    if(!Native.AlignClient(target,desired)) {Log("binding-failed align-client "+Native.Describe(target,cfg));return;}
+    client=Native.ClientBounds(target);
+   }
+   if(initialBounds.Left==client.Left&&initialBounds.Top==client.Top&&initialBounds.Width==client.Width&&initialBounds.Height==client.Height)return;
+   initialBounds=client;
+   Native.SetWindowPos(host,new IntPtr(-1),client.Left,client.Top,client.Width,client.Height,0x10);
+   Log("bound-to-app-window "+Native.Describe(target,cfg));
+  }
   private void Place() {
    if(closing)return;
    Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
@@ -295,6 +322,11 @@ namespace DragonCodexBoot {
    displayName=screen.Device;
    Bounds area=screen.Work;
    initialBounds=Geometry.Fit(area,cfg.PlayerWidth,cfg.PlayerHeight);
+   if(cfg.BindToAppWindow&&existingAtStart&&Native.Eligible(target,cfg)) {
+    Bounds client=Native.ClientBounds(target);
+    int index=Geometry.BestMonitor(client,screens.Select(s=>s.Monitor).ToArray(),screens.FindIndex(s=>(s.Flags&1)!=0));
+    initialBounds=Geometry.Contain(client,screens[index].Work);
+   }
    foreach(var s in screens)Log("display="+s.Device+" primary="+((s.Flags&1)!=0)+" physical-bounds="+s.Monitor.Left+","+s.Monitor.Top+","+s.Monitor.Width+","+s.Monitor.Height+" physical-work="+s.Work.Left+","+s.Work.Top+","+s.Work.Width+","+s.Work.Height);
    Log("placement requested="+cfg.TargetDisplay+" selected="+displayName+" physical="+initialBounds.Left+","+initialBounds.Top+","+initialBounds.Width+","+initialBounds.Height);
    if(host!=IntPtr.Zero)Native.SetWindowPos(host,new IntPtr(-1),initialBounds.Left,initialBounds.Top,initialBounds.Width,initialBounds.Height,0x10);
@@ -306,8 +338,9 @@ namespace DragonCodexBoot {
    RenderOptions.ProcessRenderMode=RenderMode.SoftwareOnly;
    cfg=c;root=baseDir;Title=String.IsNullOrWhiteSpace(c.DisplayName)?"Dragon Codex Boot":c.DisplayName;
    WindowStyle=WindowStyle.None;ResizeMode=ResizeMode.NoResize;ShowInTaskbar=false;
-   AllowsTransparency=false;Topmost=true;Background=new SolidColorBrush(Color.FromRgb(250,247,253));
+   AllowsTransparency=false;Topmost=true;Background=Brushes.Black;
    target=findApp(cfg);
+   existingAtStart=target!=IntPtr.Zero;
    Place();
    Width=cfg.PlayerWidth;Height=cfg.PlayerHeight;WindowStartupLocation=WindowStartupLocation.Manual;
    Grid grid=new Grid();
@@ -383,7 +416,7 @@ namespace DragonCodexBoot {
    return IntPtr.Zero;
   }
   private void AlignTarget() {
-   if(!cfg.MatchClientToPlayer||target==IntPtr.Zero||alignedHandle==target||alignmentAttempts>=3||wall.Elapsed.TotalSeconds-lastAlignment<.5)return;
+   if(cfg.BindToAppWindow||!cfg.MatchClientToPlayer||target==IntPtr.Zero||alignedHandle==target||alignmentAttempts>=3||wall.Elapsed.TotalSeconds-lastAlignment<.5)return;
    alignmentAttempts++;lastAlignment=wall.Elapsed.TotalSeconds;
    bool aligned=Native.AlignClient(target,initialBounds);if(aligned)alignedHandle=target;
    Log(aligned?"real-window-aligned-to-fixed-player":"real-window-alignment-inexact");
@@ -428,6 +461,7 @@ namespace DragonCodexBoot {
    if(closing)return;
    if(failed) { if(wall.Elapsed.TotalSeconds-failedAt>=8) { closing=true;Application.Current.Shutdown(2); } return; }
    Probe();
+   BindWindow();
    if(lifecycle.Expired(wall.Elapsed.TotalSeconds,cfg.MaxWaitSeconds)) { Fail("window-or-playback-timeout");return; }
    if(handoffRequested) { TryHandOff();return; }
    if(!opened) {
@@ -459,16 +493,16 @@ namespace DragonCodexBoot {
      int hr=Native.DwmUpdateThumbnailProperties(thumbnail,ref props);
      if(hr!=0) { Log("dwm-update-failed: "+hr);DropThumbnail();thumbnailFailed=true; }
     }
-    // Safe fallback gives a crossfade to the actual window if live thumbnails are unavailable.
-    if(thumbnailFailed)Opacity=1-a;
+    // Without a live thumbnail retain the animation until the actual target is activated.
    }
    if(endedAt>=0&&wall.Elapsed.TotalSeconds-endedAt>.25)HandOff();
   }
   private void HandOff() {
    if(closing)return;
    if(failed) { closing=true;Application.Current.Shutdown(2);return; }
-   handoffRequested=true;media.Stop();media.Visibility=Visibility.Collapsed;Opacity=1;DropThumbnail();
-   status.Text="正在等待 Codex 窗口…";status.Visibility=Visibility.Visible;
+   handoffRequested=true;media.Pause();
+   Log("handoff-cover-retained media-visible="+(media.Visibility==Visibility.Visible)+" thumbnail="+(thumbnail!=IntPtr.Zero));
+   if(!ready) {status.Text="正在等待 Codex 窗口…";status.Visibility=Visibility.Visible;}
    TryHandOff();
   }
   private void TryHandOff() {
@@ -487,6 +521,8 @@ namespace DragonCodexBoot {
     if(now-activationSince<1.5) {Log("foreground-activation-pending retry-within-1.5s");return;}
     Fail("foreground-activation-denied; use taskbar to open Codex");return;
    }
+   Native.DwmFlush();
+   if(!Native.Eligible(target,cfg)||Native.GetForegroundWindow()!=target) {ready=false;Log("handoff-delayed compositor-window-changed");return;}
    closing=true;timer.Stop();Close();Log("handed-off-to-real-window");
   }
   private void Fail(string reason) {
@@ -594,7 +630,7 @@ namespace DragonCodexBoot {
     if(args.Contains("--integrate-entrypoints"))return Integrate(root,"Install",true);
     Native.SetProcessDpiAwarenessContext(new IntPtr(-4));
     Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
-    Record(root,"entry version=0.2.1.0");
+    Record(root,"entry version=0.2.2.0");
     bool owns;using(Mutex mutex=new Mutex(true,"Local\\DragonCodexBoot",out owns)) {
      if(!owns) {Record(root,"launch-suppressed reason=launcher-already-running");return 0;}
      Config c=ReadConfig(root);

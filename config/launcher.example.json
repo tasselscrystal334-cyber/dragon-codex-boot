@@ -47,5 +47,6 @@
     }
   ],
   "DisplayName": "Dragon Codex Boot",
-  "TargetDisplay": "auto"
+  "TargetDisplay": "auto",
+  "BindToAppWindow": true
 }

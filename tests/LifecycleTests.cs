@@ -33,6 +33,10 @@ class LifecycleTests {
     }
    Bounds exact=Geometry.Fit(new Bounds(0,1080,1280,720),1280,720);
    var monitors=new[]{new Bounds(0,0,1920,1080),new Bounds(0,1080,1280,720)};
+   Bounds bound=Geometry.Contain(new Bounds(1600,900,1200,900),new Bounds(0,0,1920,1032));
+   Check(bound.Right<=1920&&bound.Bottom<=1032,"binding clamps oversized/offscreen client");
+   bound=Geometry.Contain(new Bounds(100,100,800,600),new Bounds(0,0,1920,1032));
+   Check(bound.Left==100&&bound.Top==100&&bound.Width==800&&bound.Height==600,"binding preserves visible client geometry");
    Check(Geometry.BestMonitor(new Bounds(0,1100,1000,600),monitors,0)==1,"auto uses existing app display");
    Check(Geometry.BestMonitor(new Bounds(),monitors,0)==0,"cold launch uses primary");
    Check(Geometry.BestMonitor(new Bounds(-2000,0,400,400),monitors,0)==0,"offscreen app falls back to primary");
