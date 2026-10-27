@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Web.Script.Serialization;
 using DragonCodexBoot;
@@ -7,7 +7,19 @@ class LifecycleTests {
  static void Check(bool b,string label) { if(!b)throw new Exception(label);checks++; }
  public static int Main() {
   try {
+   var recovery=new WindowLifecycle();
+   Check(!recovery.RequestRecovery(false,20),"recovery needs initial launch");
+   recovery.RequestLaunch(false);
+   Check(!recovery.RequestRecovery(false,9),"recovery waits for startup grace");
+   Check(!recovery.RequestRecovery(true,10),"usable window suppresses recovery");
+   Check(recovery.RequestRecovery(false,10),"explicit recovery allowed after grace");
+   Check(!recovery.RequestRecovery(false,19.9),"recovery double click suppressed");
+   Check(recovery.RequestRecovery(false,20),"second explicit recovery allowed");
+   Check(!recovery.RequestRecovery(false,40),"bounded recovery attempts");
    var life=new WindowLifecycle();
+   Check(!WindowLifecycle.CanBind(true,false),"transient cold window cannot be moved");
+   Check(WindowLifecycle.CanBind(true,true),"stable window may bind");
+   Check(!WindowLifecycle.CanBind(false,true),"disabled binding remains disabled");
    Check(!life.RequestLaunch(true),"existing window suppresses launch");
    Check(life.RequestLaunch(false),"cold launch once");
    Check(!life.RequestLaunch(false),"no retry launch");

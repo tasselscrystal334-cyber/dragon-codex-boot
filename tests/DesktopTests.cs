@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Diagnostics;
 using System.Linq;
@@ -11,7 +11,8 @@ class DesktopTests {
   try {
    Native.SetProcessDpiAwarenessContext(new IntPtr(-4));Native.SetThreadDpiAwarenessContext(new IntPtr(-4));
    Config c=Entry.ReadConfig(args[0]);c.TargetDisplay=args[1];
-   bool missing=args.Length>2&&args[2]=="missing";
+   bool recovery=args.Length>2&&args[2]=="recovery";
+   bool missing=recovery||(args.Length>2&&args[2]=="missing");
    bool shortVideo=args.Length>2&&args[2]=="short";
    bool auto=args.Length>2&&args[2]=="auto";
    bool delayed=args.Length>2&&args[2]=="delayed-content";
@@ -23,7 +24,7 @@ class DesktopTests {
    if(bound) {auto=true;c.BindToAppWindow=true;}
    if(auto)c.TargetDisplay="auto";
    if(shortVideo) { c.HoldAt=11.3;c.TransitionStart=12.7;c.TransitionEnd=13.65; }
-   if(missing)c.MaxWaitSeconds=2;
+   if(missing)c.MaxWaitSeconds=recovery?35:2;
    c.Video=args[3];c.MatchClientToPlayer=false;
    c.AutoReplaceEntrypoints=false;c.Volume=0;
    IntPtr real=Native.FindApp(c);
@@ -66,8 +67,14 @@ class DesktopTests {
    string logPath=Path.Combine(args[0],"logs","launcher.log");
    long logOffset=new FileInfo(logPath).Length;
    var timer=new DispatcherTimer();timer.Interval=TimeSpan.FromMilliseconds(100);var clock=Stopwatch.StartNew();
-   int staleFrames=0;bool waitingReappeared=false;
+   int staleFrames=0;bool waitingReappeared=false;int recoveryClicks=0;
    timer.Tick+=delegate {
+    if(recovery) {
+     var method=typeof(BootWindow).GetMethod("EnterOrRecover",System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance);
+     if(recoveryClicks==0&&clock.Elapsed.TotalSeconds>=10) {method.Invoke(boot,null);method.Invoke(boot,null);recoveryClicks=1;}
+     if(recoveryClicks==1&&clock.Elapsed.TotalSeconds>=20.2) {method.Invoke(boot,null);method.Invoke(boot,null);recoveryClicks=2;}
+     if(clock.Elapsed.TotalSeconds>=21)boot.Close();
+    }
     if(stale) {
      var flags=System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance;
      var gate=(ContentGate)typeof(BootWindow).GetField("contentGate",flags).GetValue(boot);
@@ -88,6 +95,10 @@ class DesktopTests {
    boot.Closed+=delegate { timer.Stop(); };timer.Start();int code;
    try {code=app.Run(boot);} finally {if(coldBound)Native.AlignClient(real,originalClient);}
    string log;using(var file=new FileStream(logPath,FileMode.Open,FileAccess.Read,FileShare.ReadWrite)) {file.Seek(logOffset,SeekOrigin.Begin);using(var reader=new StreamReader(file))log=reader.ReadToEnd();}
+   if(recovery) {
+    if(launches!=3||recoveryClicks!=2||timedout||!log.Contains("user-requested-recovery")||!log.Contains("user-recovery-suppressed")||log.Contains("handed-off-to-real-window"))throw new Exception("Recovery flow failed launches="+launches);
+    Console.WriteLine("PASS recovery desktop: two explicit retries, double-click suppressed, no automatic relaunch; AppLaunch injected");return 0;
+   }
    if(missing) {
     if(code!=2||outside||timedout||launches!=1||!log.Contains("handoff-failed reason=window-or-playback-timeout")||log.Contains("handed-off-to-real-window"))throw new Exception("Missing-window fallback failed exit="+code+" launches="+launches);
     Console.WriteLine("PASS desktop missing-window: one injected launch, bounded timeout, failure UI auto-exit; no real AppLaunch");return 0;
